@@ -1,0 +1,32 @@
+# 运行目录（存放 registry、socket、日志等）
+runtime_dir = "/Users/alice/.code-nav"
+
+# 控制端点：优先使用 UDS；Windows 可改为 npipe://code-nav-master
+socket = "uds:///Users/alice/.code-nav/master.sock"
+
+# 守护进程行为
+foreground = false
+grace_period_secs = 15
+
+[log]
+level = "info"
+file = "/Users/alice/.code-nav/logs/master.log"
+rotate = { size_mb = 32, keep = 5 }
+
+[autostart]
+mode = "all"        # 可选：none / all / list
+projects = []       # 若 mode = "list"，在此列出路径
+
+[worker_defaults]
+index_mode = "auto" # full / incremental / auto
+watch = true
+env = { CODE_NAV_EMBEDDING = "ggml" }
+extra_args = []
+
+[projects."/Users/alice/dev/project-a"]
+last_running = true
+socket = "uds:///Users/alice/.code-nav/projects/project-a.sock"
+
+[projects."/Users/alice/dev/project-b"]
+last_running = false
+socket = "uds:///Users/alice/.code-nav/projects/project-b.sock"
