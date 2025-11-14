@@ -52,3 +52,32 @@
 - `code-navd project status --project <path>`：查看指定项目的详细状态（索引进度、任务队列、watcher、监听端点）。参数：`--project <path>`、`--socket <uri>`。
 - `code-navd project restart --project <path>`：对指定项目执行 stop→start，常用于重载配置/模型。共享 `--socket <uri>`、`--grace <secs>`、`--index-mode ...`。
 - `code-navd check [--project <path>]`：执行配置/环境自检；若指定项目，则检查其 `.code-nav/`、权限与端点可用性。参数：`--config <path>`、`--socket <uri>`、`--project <path>`。
+
+### 7.1 `code-nav project` 子命令交互设计
+
+- **入口行为**：`code-nav project <subcommand>`。当用户只输入 `code-nav project` 或 `code-nav project --help` 时，CLI 输出子命令概览而非报错，示例格式：
+  ```
+  Project 子命令用于管理受管项目：
+    code-nav project add     将项目添加到 registry 并启动 worker
+    code-nav project remove  停止并移除项目
+    code-nav project list    列出所有受管项目及状态
+    code-nav project status  查看指定项目的详细状态
+    code-nav project restart 重启指定项目 worker
+
+  示例：
+    code-nav project add --project ~/repo
+    code-nav project status --project foo
+    code-nav project restart --project foo --wait
+
+  使用 `code-nav project help <subcommand>` 查看详细说明。
+  ```
+  实现上可利用 clap 的 `arg_required_else_help = true` 或手写 `print_project_usage()`；空调用帮助返回 exit code 0，方便脚本解析。
+
+- **子命令摘要**：
+  - `project add --project <path> [--autostart] [--watch]`：将项目写入 registry、创建 `.code-nav/` 并自动启动 worker。
+  - `project remove --project <path> [--force] [--keep-data]`：优雅停止并移除项目记录，必要时可强制。
+  - `project list [--format table|json] [--status running|failed|stopped]`：列出全部项目及状态。
+  - `project status --project <path|id>`：输出单项目详情（worker PID、索引版本、watcher、最近请求时间）。
+  - `project restart --project <path|id> [--wait] [--grace <sec>] [--force]`：触发单项目 stop→start，复用 restart 流程。
+- **批量与扩展**：支持多个 `--project`、`--all`、`--failed` 等扩展参数，内部顺序执行或受 `--max-parallel` 限制。
+- **协议映射**：各子命令对应 `ProjectAddRequest`、`ProjectRemoveRequest`、`ProjectListRequest`、`ProjectStatusRequest`、`RestartRequest(scope=project)`；空调用提示不触发任何 RPC。

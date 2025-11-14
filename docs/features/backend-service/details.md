@@ -90,3 +90,12 @@
 ## 10. 配置 & 模型管理（扩展）
 - CLI：`code-nav config set <key> <value>`、`code-nav config get <key>`、`code-nav models list`、`code-nav models select <name>`（可带 `--project` 针对特定 worker，或不带针对 master/global）。
 - 行为：集中管理 embedding/向量后端与网络/API Key，必要时通知 master/worker 热更新。
+
+## 11. `code-nav project` 子命令概览
+- **命令结构**：`code-nav project <subcommand> [options]`，统一继承全局选项（`--socket`, `--runtime-dir`, `--json` 等）；当仅输入 `code-nav project` 时输出子命令列表与示例。
+- **project add**：参数 `--project <path>`、`--id <custom-id>`、`--autostart`、`--watch`、`--index-mode`、`--model`；行为是注册项目、创建 `.code-nav/`、更新 registry 并按策略启动 worker；对应 `ProjectAddRequest`。
+- **project remove**：参数 `--project`, `--force`, `--keep-data`, `--grace`；行为是优雅停止 worker、删除锁/PID、清理 registry，可选择保留数据；对应 `ProjectRemoveRequest`。
+- **project list**：参数 `--format table|json`, `--filter status=<running|failed|stopped>`, `--verbose`；输出项目 ID、路径、状态、最近索引时间、worker PID；对应 `ProjectListRequest`。
+- **project status**：参数 `--project`, `--json`, `--fields`；展示单项目的 worker 状态、索引进度、watcher、最近请求、向量库版本；对应 `ProjectStatusRequest`。
+- **project restart**：参数 `--project`, `--wait`, `--grace`, `--force`, `--timeout`, `--reason`；执行单项目 stop→start，复用 restart 流程，映射 `RestartRequest(scope=project)`。
+- **扩展命令（可选）**：保留 `project start/stop`, `project logs`, `project inspect`, `project sync` 等拓展点，对应未来协议；CLI 输出应保持一致的帮助文本/示例/退出码，并支持 `--json` 模式供脚本使用。

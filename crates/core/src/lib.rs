@@ -1,9 +1,9 @@
-pub mod indexer;
-pub mod watcher;
-pub mod metadata;
 pub mod embedding;
-pub mod vectorstore;
+pub mod indexer;
+pub mod metadata;
 pub mod search;
+pub mod vectorstore;
+pub mod watcher;
 
 use serde::{Deserialize, Serialize};
 

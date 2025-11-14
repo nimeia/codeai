@@ -1,49 +1,164 @@
+mod master;
+
 use anyhow::Result;
-use code-nav-core::{indexer, search};
-use code-nav-protocol::{Envelope, Request, Response};
+use clap::{Args, Parser, Subcommand};
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt::try_init().ok();
-    tracing::info!("code-nav server booting");
-
-    // Placeholder: respond to a mock search request to show wiring.
-    let req = Envelope {
-        id: "0".into(),
-        data: Request::Search(code_nav_protocol::SearchRequest {
-            query: "example".into(),
-            top_k: 5,
-        }),
-    };
-    let resp = handle_request(req.data);
-    println!("{}", serde_json::to_string(&resp)?);
-    Ok(())
+#[derive(Parser)]
+#[command(name = "code-navd", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn handle_request(req: Request) -> Response {
-    match req {
-        Request::Search(payload) => {
-            let hits = search::semantic(&payload.query, payload.top_k as usize)
-                .into_iter()
-                .map(|hit| code_nav_protocol::SearchHit {
-                    file: hit.file,
-                    line: hit.line,
-                    score: hit.score,
-                    snippet: String::from("placeholder"),
-                })
-                .collect();
-            Response::Search(code_nav_protocol::SearchResponse { hits })
+#[derive(Subcommand)]
+enum Command {
+    /// 启动 code-nav master
+    Start(StartArgs),
+    /// 停止 code-nav master
+    Stop(StopArgs),
+    /// 重启 code-nav master
+    Restart(RestartArgs),
+    /// 其它子命令占位
+    #[allow(dead_code)]
+    #[command(hide = true)]
+    Unknown,
+}
+
+#[derive(Args, Debug)]
+struct StartArgs {
+    /// 指定 master 配置文件路径
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+    /// 覆盖运行目录（默认 ~/.code-nav）
+    #[arg(long)]
+    runtime_dir: Option<std::path::PathBuf>,
+    /// 覆盖控制端点 URI（uds://, npipe://, tcp://）
+    #[arg(long)]
+    socket: Option<String>,
+    /// 设置日志级别
+    #[arg(long, value_enum)]
+    log_level: Option<master::LogLevel>,
+    /// 前台运行（默认配置可覆盖）
+    #[arg(long)]
+    foreground: bool,
+    /// 停机等待秒数
+    #[arg(long)]
+    grace: Option<u64>,
+    /// 自动启动策略
+    #[arg(long, value_enum, default_value = "all")]
+    autostart: master::AutostartMode,
+}
+
+#[derive(Args, Debug)]
+struct StopArgs {
+    /// 使用特定配置文件解析 runtime_dir/socket
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+    /// 指定运行目录（覆盖配置）
+    #[arg(long)]
+    runtime_dir: Option<std::path::PathBuf>,
+    /// 覆盖控制端点 URI
+    #[arg(long)]
+    socket: Option<String>,
+    /// 优雅等待时间（秒）
+    #[arg(long, default_value_t = 10)]
+    grace: u64,
+    /// 总超时时间（秒）
+    #[arg(long, default_value_t = 30)]
+    timeout: u64,
+    /// 超时后是否强制终止
+    #[arg(long)]
+    force: bool,
+    /// 跳过确认提示
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args, Debug)]
+struct RestartArgs {
+    /// 指定配置文件（同时用于 stop/start）
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+    /// 覆盖运行目录
+    #[arg(long)]
+    runtime_dir: Option<std::path::PathBuf>,
+    /// 覆盖控制端点
+    #[arg(long)]
+    socket: Option<String>,
+    /// start 时的日志级别
+    #[arg(long, value_enum)]
+    log_level: Option<master::LogLevel>,
+    /// start 是否前台运行
+    #[arg(long)]
+    foreground: bool,
+    /// start 的 grace (秒)
+    #[arg(long)]
+    start_grace: Option<u64>,
+    /// start 的自动启动策略
+    #[arg(long, value_enum, default_value = "all")]
+    autostart: master::AutostartMode,
+    /// stop 阶段宽限期
+    #[arg(long, default_value_t = 10)]
+    stop_grace: u64,
+    /// stop 阶段超时时间
+    #[arg(long, default_value_t = 30)]
+    stop_timeout: u64,
+    /// stop 是否允许强制
+    #[arg(long)]
+    stop_force: bool,
+    /// 是否跳过确认（默认跳过）
+    #[arg(long)]
+    prompt: bool,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Start(args) => {
+            let start = master::StartCommand {
+                config_path: args.config,
+                runtime_dir: args.runtime_dir,
+                socket: args.socket,
+                log_level: args.log_level,
+                foreground: args.foreground,
+                grace: args.grace,
+                autostart: args.autostart,
+            };
+            master::run_start(start)
         }
-        Request::Index(job) => {
-            let _ = indexer::run(code_nav_core::indexer::IndexJob {
-                full: matches!(job.mode, code_nav_protocol::IndexMode::Full),
-            });
-            Response::Index(code_nav_protocol::IndexResponse { started: true })
+        Command::Stop(args) => {
+            let stop = master::StopCommand {
+                config_path: args.config,
+                runtime_dir: args.runtime_dir,
+                socket: args.socket,
+                grace_secs: args.grace,
+                timeout_secs: args.timeout,
+                force: args.force,
+                assume_yes: args.yes,
+            };
+            master::run_stop(stop)
         }
-        Request::Info => Response::Info(code_nav_protocol::InfoResponse {
-            protocol_version: "0.1.0".into(),
-        }),
-        Request::Status => Response::Status(Default::default()),
-        Request::Goto(_) => Response::Goto(Default::default()),
-        Request::List(_) => Response::List(Default::default()),
+        Command::Restart(args) => {
+            let start = master::StartCommand {
+                config_path: args.config.clone(),
+                runtime_dir: args.runtime_dir.clone(),
+                socket: args.socket.clone(),
+                log_level: args.log_level,
+                foreground: args.foreground,
+                grace: args.start_grace,
+                autostart: args.autostart,
+            };
+            let stop = master::StopCommand {
+                config_path: args.config,
+                runtime_dir: args.runtime_dir,
+                socket: args.socket,
+                grace_secs: args.stop_grace,
+                timeout_secs: args.stop_timeout,
+                force: args.stop_force,
+                assume_yes: !args.prompt,
+            };
+            master::run_restart(master::RestartCommand { start, stop })
+        }
+        Command::Unknown => Ok(()),
     }
 }

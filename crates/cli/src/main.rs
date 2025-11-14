@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use code-nav-protocol::{ListKind, Request};
+use code_nav_protocol::{ListKind, Request};
 
 #[derive(Parser)]
 #[command(name = "code-nav", version, about = "code navigation cli")]
@@ -11,8 +11,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Search { query: String, #[arg(default_value_t = 5)] top_k: u32 },
-    List { #[arg(value_enum)] kind: Kind },
+    Search {
+        query: String,
+        #[arg(default_value_t = 5)]
+        top_k: u32,
+    },
+    List {
+        #[arg(value_enum)]
+        kind: Kind,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -26,14 +33,20 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
     let cli = Cli::parse();
     let request = match cli.command {
-        Commands::Search { query, top_k } => Request::Search(code_nav_protocol::SearchRequest { query, top_k }),
+        Commands::Search { query, top_k } => {
+            Request::Search(code_nav_protocol::SearchRequest { query, top_k })
+        }
         Commands::List { kind } => {
             let list_kind = match kind {
                 Kind::Classes => ListKind::Classes,
                 Kind::Methods => ListKind::Methods,
                 Kind::Files => ListKind::Files,
             };
-            Request::List(code_nav_protocol::ListRequest { kind: list_kind, filter: None, limit: None })
+            Request::List(code_nav_protocol::ListRequest {
+                kind: list_kind,
+                filter: None,
+                limit: None,
+            })
         }
     };
 
