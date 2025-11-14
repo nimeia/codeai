@@ -26,7 +26,7 @@
 4. **控制端点建立**：详见 @/docs/features/backend-service/start-master-endpoint.md；创建 UDS/Named Pipe/TCP 监听并完成握手与安全校验。
 5. **项目 registry 恢复**：详见 @/docs/features/backend-service/start-master-registry.md；加载 registry.json，校验项目状态、清理残留并准备自动启动列表。
 6. **自动启动策略**：详见 @/docs/features/backend-service/start-master-autostart.md；根据配置构建启动队列、控制并发、重试失败并可选空闲回收。
-7. **主循环与信号处理**：注册 SIGTERM/SIGINT（或 Windows 控制事件），优雅停机时向所有 worker 发送 `Shutdown`；主循环处理 CLI 请求路由、worker 状态更新、闲置回收。
+7. **主循环与信号处理**：详见 @/docs/features/backend-service/start-master-mainloop.md；注册信号、处理 CLI 命令/worker 心跳、执行自动启动与空闲回收、实现优雅停机。
 8. **启动反馈**：成功后输出“master running”日志/提示；前台模式保持控制台输出，后台模式可写 readiness 文件或在 CLI 中反馈成功。
 
 ## 3. 项目 worker
