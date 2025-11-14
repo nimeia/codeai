@@ -35,6 +35,16 @@
 3. **守护进程关机**：详见 @/docs/features/backend-service/stop-master-shutdown.md；master 进入 `Stopping` 状态后停止监听新请求，广播 worker `Shutdown`，等待宽限期并在需要时强制终止，清理锁/Socket/PID、flush 日志与 metrics。
 4. **可观测性与测试**：stop 流程需输出 `shutdown_request/shutdown_progress/shutdown_complete` 日志、metrics（`shutdown_total` 等），并覆盖幂等、超时、force、拒绝停机等路径的单元与集成测试。
 
+### 2.3 `code-navd restart` 详细流程
+1. **命令定位**：restart = stop + start，既可作用于 master（全局重启）也可作用于单个项目 worker，用于加载配置或恢复异常。
+2. **CLI 设计**：`code-nav restart [--wait] [--grace <sec>] [--force]`、`code-nav project restart --project <path|id>`；提供 `--wait`（默认 true）、`--grace`（沿用 stop 宽限期）、`--force`（强制终止）、阶段提示与退出码（0 成功、2 拒绝/不存在、3 超时、1 其他）。
+3. **协议扩展**：在 protocol crate 中定义 `Request::Restart(RestartRequest { scope, force, grace_secs, wait_ready })`、`Response::Restart(RestartResponse { state, message })`；`RestartScope=Master|Project(ProjectId)`、`RestartState=Accepted|AlreadyRestarting|Completed|Failed`；错误码沿用 Busy/NotIndexed/PermissionDenied/InternalError。
+4. **Server 流程**：
+   - Master 重启：状态切换至 `Restarting`，向所有 worker 发送 `Shutdown`，等待退出后清理锁/PID，重新启动或通知外层自动拉起；CLI 首先收到 `Accepted`，待监听器恢复后可通过 `wait_ready` 确认 `Completed`。
+   - Worker 重启：主循环暂停该项目请求，发送 `WorkerShutdown { grace }`，等待退出后复用 autostart 启动流程，更新 registry 并通知结果；支持按队列逐个或限制并发。
+5. **状态协作**：`state::AppState` 记录 `Restarting` 标记、最近一次重启原因与时间；registry 记录项目级重启结果；watcher/indexer 在停机前 checkpoint，重启后恢复。
+6. **测试与验收**：CLI 参数解析与提示、协议序列化、server 状态机单测，以及集成测试（重启 master、单 worker、并发、多任务期间重启）覆盖成功/超时/force/拒绝流程。
+
 ## 3. 项目 worker
 - 每个项目由 master 自动派生 worker 进程承担索引/搜索/监听逻辑，入口命令仍为 `code-navd`（内部子命令区分角色）。
 - Worker 启动细则：
