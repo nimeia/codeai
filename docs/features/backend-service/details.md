@@ -23,7 +23,7 @@
 1. **配置解析**：流程详见 @/docs/features/backend-service/start-master-config.md；读取默认配置、环境变量与 CLI 参数，生成 `MasterConfig` 并校验控制端点与 `.code-nav/` 目录。
 2. **单实例检测**：详见 @/docs/features/backend-service/start-master-single-instance.md；通过 `master.lock/master.pid` 防止重复实例，检测僵尸并输出提示。
 3. **日志与监控初始化**：详见 @/docs/features/backend-service/start-master-logging.md；根据配置设置 tracing（级别、文件/STDOUT、轮转）并可选启动 metrics/health 服务。
-4. **控制端点建立**：创建 UDS（0600 权限）、Named Pipe 或 TCP loopback 监听，准备接受 CLI 请求（复用 master RPC 协议）。
+4. **控制端点建立**：详见 @/docs/features/backend-service/start-master-endpoint.md；创建 UDS/Named Pipe/TCP 监听并完成握手与安全校验。
 5. **项目 registry 恢复**：读取 `~/.code-nav/projects/registry`，加载历史项目，检测 worker 是否存活，更新状态并清理僵尸锁。
 6. **自动启动策略**：根据配置的 `autostart` 或 `auto_resume` 启动各项目 worker（spawn 子进程），等待 worker ready（握手或 socket 就绪）。
 7. **主循环与信号处理**：注册 SIGTERM/SIGINT（或 Windows 控制事件），优雅停机时向所有 worker 发送 `Shutdown`；主循环处理 CLI 请求路由、worker 状态更新、闲置回收。
