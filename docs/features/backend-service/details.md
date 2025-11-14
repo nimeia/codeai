@@ -20,7 +20,7 @@
   - 优雅停机：master 退出前发出 `Shutdown` 给所有 worker，等待其完成后再关闭自身。
 
 ### 2.1 `code-navd start` 详细流程
-1. **配置解析**：读取默认配置（`~/.config/code-nav/master.toml`）、环境变量与 CLI 参数（`--config/--socket/--log-level/--foreground/--grace`），合并为 `MasterConfig`，校验控制端点与 `.code-nav/` 目录（必要时创建）。
+1. **配置解析**：流程详见 @/docs/features/backend-service/start-master-config.md；读取默认配置、环境变量与 CLI 参数，生成 `MasterConfig` 并校验控制端点与 `.code-nav/` 目录。
 2. **单实例检测**：在 `runtime_dir` 创建/锁定 `master.lock` 并写入 `master.pid`；若锁失败则检查现有 master 是否运行，存在则提示并退出。
 3. **日志与监控初始化**：根据配置设置 tracing（级别、文件/STDOUT、轮转），可选启动 metrics/health 服务。
 4. **控制端点建立**：创建 UDS（0600 权限）、Named Pipe 或 TCP loopback 监听，准备接受 CLI 请求（复用 master RPC 协议）。
