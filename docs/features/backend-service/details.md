@@ -27,7 +27,7 @@
 5. **项目 registry 恢复**：详见 @/docs/features/backend-service/start-master-registry.md；加载 registry.json，校验项目状态、清理残留并准备自动启动列表。
 6. **自动启动策略**：详见 @/docs/features/backend-service/start-master-autostart.md；根据配置构建启动队列、控制并发、重试失败并可选空闲回收。
 7. **主循环与信号处理**：详见 @/docs/features/backend-service/start-master-mainloop.md；注册信号、处理 CLI 命令/worker 心跳、执行自动启动与空闲回收、实现优雅停机。
-8. **启动反馈**：成功后输出“master running”日志/提示；前台模式保持控制台输出，后台模式可写 readiness 文件或在 CLI 中反馈成功。
+8. **启动反馈**：详见 @/docs/features/backend-service/start-master-feedback.md；提供前台/后台提示、wait-ready、失败清理与系统集成钩子。
 
 ## 3. 项目 worker
 - 每个项目由 master 自动派生 worker 进程承担索引/搜索/监听逻辑，入口命令仍为 `code-navd`（内部子命令区分角色）。
