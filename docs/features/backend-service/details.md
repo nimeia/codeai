@@ -2,7 +2,7 @@
 
 ## 1. 总览任务
 1. Master 启动流程（`code-navd start`）：定义配置结构、控制端点创建、前台/后台模式、日志初始化。
-2. 项目注册与 worker 管理（`project add/remove/list/status/restart`）：设计 registry、worker 启停、自动重启/回收策略。
+2. 项目注册与 worker 管理（`project add/remove/list/status/restart/stop`）：设计 registry、worker 启停、自动重启/回收策略。
 3. IPC 协议扩展：在 protocol crate 中增加 master↔worker、CLI↔master 的请求/响应类型。
 4. 索引/搜索 API 适配 master：明确 CLI `search/list/goto/tree/index/status/info` 的 `--project` 参数和路由逻辑。
 5. Worker 生命周期细节：整理项目级启动/停止步骤（配置校验、锁文件、资源加载、watcher、信号处理）。
@@ -17,7 +17,7 @@
   - 项目 registry：记录 `project_root`、worker PID、IPC 地址、索引状态、最近活动时间。
   - 请求路由：接收 CLI 命令，按 `project` 参数启动/选择 worker，转发 `search/goto/list/tree/index` 等 RPC 并返回结果。
   - 监控与调度：监听 worker 存活、崩溃、闲置；按策略回收或重启。
-  - 优雅停机：master 退出前发出 `Shutdown` 给所有 worker，等待其完成后再关闭自身。
+- 优雅停机：master 接受 `code-nav stop` 后发出 `Shutdown` 给所有 worker，等待其完成后再关闭自身。
 
 ### 2.1 `code-navd start` 详细流程
 1. **配置解析**：流程详见 @/docs/features/backend-service/start-master-config.md；读取默认配置、环境变量与 CLI 参数，生成 `MasterConfig` 并校验控制端点与 `.code-nav/` 目录。
@@ -29,6 +29,12 @@
 7. **主循环与信号处理**：详见 @/docs/features/backend-service/start-master-mainloop.md；注册信号、处理 CLI 命令/worker 心跳、执行自动启动与空闲回收、实现优雅停机。
 8. **启动反馈**：详见 @/docs/features/backend-service/start-master-feedback.md；提供前台/后台提示、wait-ready、失败清理与系统集成钩子。
 
+### 2.2 `code-navd stop` 详细流程
+1. **命令入口**：详见 @/docs/features/backend-service/stop-master-cli.md；定义 `code-nav stop` 子命令语法、`--grace/--timeout/--force/--yes` 参数、幂等策略与 CLI 输出/退出码。
+2. **协议与路由**：详见 @/docs/features/backend-service/stop-master-protocol.md；扩展 protocol crate 的 `Request::Stop`、`Response::Stop`、`StopState`，并描述权限校验与错误码（Busy/PermissionDenied 等）。
+3. **守护进程关机**：详见 @/docs/features/backend-service/stop-master-shutdown.md；master 进入 `Stopping` 状态后停止监听新请求，广播 worker `Shutdown`，等待宽限期并在需要时强制终止，清理锁/Socket/PID、flush 日志与 metrics。
+4. **可观测性与测试**：stop 流程需输出 `shutdown_request/shutdown_progress/shutdown_complete` 日志、metrics（`shutdown_total` 等），并覆盖幂等、超时、force、拒绝停机等路径的单元与集成测试。
+
 ## 3. 项目 worker
 - 每个项目由 master 自动派生 worker 进程承担索引/搜索/监听逻辑，入口命令仍为 `code-navd`（内部子命令区分角色）。
 - Worker 启动细则：
@@ -39,7 +45,7 @@
   5. 服务/任务启动：启动与 master 的 IPC 监听，注册 RPC 路由；启动文件 watcher 与索引调度器。
   6. 索引状态：启动时执行健康检查或触发增量索引，记录索引版本/队列。
   7. 生命周期管理：注册信号处理，确保 `project remove`/`stop` 时优雅退出；向 master 汇报状态。
-- Worker 停止流程参照 @/docs/features/backend-service/stop.md（通过 IPC 指令或 PID 信号优雅退出）。
+- Worker 停止流程参照 @/docs/features/backend-service/stop-master-shutdown.md（由 master 通过 IPC 触发优雅退出，必要时执行强制终止）。
 
 ## 4. 索引管理
 - API：`/index/full`、`/index/incremental`。
