@@ -38,12 +38,4 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 ```
 
-同样地，`code-nav logs` 也已经提供了参数解析与预览能力，可通过以下方式查看：
-
-```bash
-cargo run -p code-nav-cli -- logs --help
-```
-
-日志命令支持 `--target/--project/--since/--limit/--follow/--level/--json/--color` 等参数，并会把解析结果整理成 JSON 结构，便于在后续实现守护进程日志流接口时直接复用。
-
 后续可在各 crate 中逐步替换占位实现，接入 tree-sitter、embedding 后端、HNSW 向量库等真实逻辑。
