@@ -93,9 +93,9 @@
 
 ## 11. `code-nav project` 子命令概览
 - **命令结构**：`code-nav project <subcommand> [options]`，统一继承全局选项（`--socket`, `--runtime-dir`, `--json` 等）；当仅输入 `code-nav project` 时输出子命令列表与示例。
-- **project add**：参数 `--project <path>`、`--id <custom-id>`、`--autostart`、`--watch`、`--index-mode`、`--model`；行为是注册项目、创建 `.code-nav/`、更新 registry 并按策略启动 worker；对应 `ProjectAddRequest`。
-- **project remove**：参数 `--project`, `--force`, `--keep-data`, `--grace`；行为是优雅停止 worker、删除锁/PID、清理 registry，可选择保留数据；对应 `ProjectRemoveRequest`。
-- **project list**：参数 `--format table|json`, `--filter status=<running|failed|stopped>`, `--verbose`；输出项目 ID、路径、状态、最近索引时间、worker PID；对应 `ProjectListRequest`。
-- **project status**：参数 `--project`, `--json`, `--fields`；展示单项目的 worker 状态、索引进度、watcher、最近请求、向量库版本；对应 `ProjectStatusRequest`。
-- **project restart**：参数 `--project`, `--wait`, `--grace`, `--force`, `--timeout`, `--reason`；执行单项目 stop→start，复用 restart 流程，映射 `RestartRequest(scope=project)`。
+- **project add**：参数 `--project <path>`、`--id <custom-id>`、`--autostart`、`--watch`、`--index-mode`、`--model`；行为是注册项目、创建 `.code-nav/`、更新 registry 并按策略启动 worker；对应 `ProjectAddRequest`。详细拆解见 @/docs/features/backend-service/project-add.md。
+- **project remove**：参数 `--project`, `--force`, `--keep-data`, `--grace`；行为是优雅停止 worker、删除锁/PID、清理 registry，可选择保留数据；对应 `ProjectRemoveRequest`。详细拆解见 @/docs/features/backend-service/project-remove.md。
+- **project list**：参数 `--format table|json`, `--filter status=<running|failed|stopped>`, `--verbose`；输出项目 ID、路径、状态、最近索引时间、worker PID；对应 `ProjectListRequest`。详细拆解见 @/docs/features/backend-service/project-list.md。
+- **project status**：参数 `--project`, `--json`, `--fields`；展示单项目的 worker 状态、索引进度、watcher、最近请求、向量库版本；对应 `ProjectStatusRequest`。详细拆解见 @/docs/features/backend-service/project-status.md。
+- **project restart**：参数 `--project`, `--wait`, `--grace`, `--force`, `--timeout`, `--reason`；执行单项目 stop→start，复用 restart 流程，映射 `RestartRequest(scope=project)`；详见 @/docs/features/backend-service/project-restart.md。
 - **扩展命令（可选）**：保留 `project start/stop`, `project logs`, `project inspect`, `project sync` 等拓展点，对应未来协议；CLI 输出应保持一致的帮助文本/示例/退出码，并支持 `--json` 模式供脚本使用。

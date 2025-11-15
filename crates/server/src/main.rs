@@ -1,7 +1,11 @@
 mod master;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+
+const READY_TIMEOUT_DEFAULT: u64 = 30;
 
 #[derive(Parser)]
 #[command(name = "code-navd", version)]
@@ -47,6 +51,15 @@ struct StartArgs {
     /// 自动启动策略
     #[arg(long, value_enum, default_value = "all")]
     autostart: master::AutostartMode,
+    /// 启动后等待控制端点 ready（默认开启）
+    #[arg(long = "wait-ready", action = clap::ArgAction::SetTrue, conflicts_with = "no_wait")]
+    wait_ready: bool,
+    /// 启动后立即返回，不等待 ready
+    #[arg(long = "no-wait", action = clap::ArgAction::SetTrue, conflicts_with = "wait_ready")]
+    no_wait: bool,
+    /// 等待 ready 的超时（秒）
+    #[arg(long, default_value_t = READY_TIMEOUT_DEFAULT)]
+    ready_timeout: u64,
 }
 
 #[derive(Args, Debug)]
@@ -109,12 +122,55 @@ struct RestartArgs {
     /// 是否跳过确认（默认跳过）
     #[arg(long)]
     prompt: bool,
+    /// restart 时 start 阶段是否等待 ready（默认开启）
+    #[arg(long = "start-wait-ready", action = clap::ArgAction::SetTrue, conflicts_with = "start_no_wait")]
+    start_wait_ready: bool,
+    /// restart 时 start 阶段不等待 ready
+    #[arg(long = "start-no-wait", action = clap::ArgAction::SetTrue, conflicts_with = "start_wait_ready")]
+    start_no_wait: bool,
+    /// restart 时等待 ready 的超时（秒）
+    #[arg(long = "start-ready-timeout", default_value_t = READY_TIMEOUT_DEFAULT)]
+    start_ready_timeout: u64,
+}
+
+impl StartArgs {
+    fn wait_ready(&self) -> bool {
+        if self.no_wait {
+            false
+        } else if self.wait_ready {
+            true
+        } else {
+            true
+        }
+    }
+
+    fn ready_timeout(&self) -> Duration {
+        Duration::from_secs(self.ready_timeout.clamp(1, 600))
+    }
+}
+
+impl RestartArgs {
+    fn start_wait_ready(&self) -> bool {
+        if self.start_no_wait {
+            false
+        } else if self.start_wait_ready {
+            true
+        } else {
+            true
+        }
+    }
+
+    fn start_ready_timeout(&self) -> Duration {
+        Duration::from_secs(self.start_ready_timeout.clamp(1, 600))
+    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Start(args) => {
+            let wait_ready = args.wait_ready();
+            let ready_timeout = args.ready_timeout();
             let start = master::StartCommand {
                 config_path: args.config,
                 runtime_dir: args.runtime_dir,
@@ -123,6 +179,8 @@ fn main() -> Result<()> {
                 foreground: args.foreground,
                 grace: args.grace,
                 autostart: args.autostart,
+                wait_ready,
+                ready_timeout,
             };
             master::run_start(start)
         }
@@ -139,6 +197,8 @@ fn main() -> Result<()> {
             master::run_stop(stop)
         }
         Command::Restart(args) => {
+            let start_wait_ready = args.start_wait_ready();
+            let start_ready_timeout = args.start_ready_timeout();
             let start = master::StartCommand {
                 config_path: args.config.clone(),
                 runtime_dir: args.runtime_dir.clone(),
@@ -147,6 +207,8 @@ fn main() -> Result<()> {
                 foreground: args.foreground,
                 grace: args.start_grace,
                 autostart: args.autostart,
+                wait_ready: start_wait_ready,
+                ready_timeout: start_ready_timeout,
             };
             let stop = master::StopCommand {
                 config_path: args.config,
