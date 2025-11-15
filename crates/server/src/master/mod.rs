@@ -21,7 +21,7 @@ use fslock::LockFile;
 use is_terminal::IsTerminal;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{info, warn, Level};
+use tracing::{debug, info, warn, Level};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -34,6 +34,8 @@ pub struct StartCommand {
     pub foreground: bool,
     pub grace: Option<u64>,
     pub autostart: AutostartMode,
+    pub wait_ready: bool,
+    pub ready_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -57,6 +59,15 @@ pub fn run_start(args: StartCommand) -> Result<()> {
     let config = MasterConfig::load(&args)?;
     let _lock = MasterLock::acquire(&config)?;
     let logging = LoggingGuards::init(&config)?;
+
+    if args.wait_ready {
+        debug!(
+            wait_timeout_secs = args.ready_timeout.as_secs(),
+            "wait-ready enabled (placeholder until background mode is implemented)"
+        );
+    } else {
+        warn!("--no-wait 指定，但当前 master 仍以前台模式运行");
+    }
 
     if !config.foreground {
         warn!("后台模式尚未实现，当前进程将以前台模式运行");
