@@ -181,6 +181,7 @@ name = "code-nav-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "code-nav-protocol",
  "dirs",

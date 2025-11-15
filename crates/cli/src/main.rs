@@ -5,7 +5,10 @@ mod formatter;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use code_nav_protocol::{ListKind, Request};
-use commands::project::{self, ProjectCommand};
+use commands::{
+    logs::{self, LogsArgs},
+    project::{self, ProjectCommand},
+};
 
 #[derive(Parser)]
 #[command(name = "code-nav", version, about = "code navigation cli")]
@@ -29,6 +32,7 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectCommand,
     },
+    Logs(LogsArgs),
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -63,6 +67,9 @@ fn main() -> Result<()> {
         }
         Commands::Project { action } => {
             project::run(action)?;
+        }
+        Commands::Logs(args) => {
+            logs::run(args)?;
         }
     }
     Ok(())

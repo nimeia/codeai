@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,6 +11,7 @@ pub enum Request {
     Goto(GotoRequest),
     List(ListRequest),
     Index(IndexRequest),
+    Logs(LogsRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +23,7 @@ pub enum Response {
     Goto(GotoResponse),
     List(ListResponse),
     Index(IndexResponse),
+    Logs(LogsResponse),
     Error(ErrorBody),
 }
 
@@ -89,6 +93,63 @@ pub struct IndexRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IndexResponse {
     pub started: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsRequest {
+    pub target: LogTarget,
+    pub since: Option<i64>,
+    pub limit: Option<u32>,
+    pub follow: bool,
+    pub follow_interval_ms: Option<u64>,
+    pub level: Option<LogLevel>,
+    pub format: LogOutputFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LogsResponse {
+    pub events: Vec<LogEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogTarget {
+    Master,
+    Worker(ProjectRef),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRef {
+    Path(String),
+    Id(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogOutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEvent {
+    pub ts: i64,
+    pub level: LogLevel,
+    pub source: String,
+    pub target: Option<String>,
+    pub message: String,
+    pub fields: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
