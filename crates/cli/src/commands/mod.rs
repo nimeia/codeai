@@ -1,3 +1,1 @@
-pub fn describe() {
-    tracing::debug!("command registry placeholder");
-}
+pub mod project;

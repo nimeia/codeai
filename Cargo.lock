@@ -183,6 +183,7 @@ dependencies = [
  "anyhow",
  "clap",
  "code-nav-protocol",
+ "dirs",
  "serde",
  "serde_json",
  "tracing",
