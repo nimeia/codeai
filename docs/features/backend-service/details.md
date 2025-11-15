@@ -97,9 +97,14 @@
 - **project remove**：参数 `--project`, `--force`, `--keep-data`, `--grace`；行为是优雅停止 worker、删除锁/PID、清理 registry，可选择保留数据；对应 `ProjectRemoveRequest`。详细拆解见 @/docs/features/backend-service/project-remove.md。
 - **project list**：参数 `--format table|json`, `--filter status=<running|failed|stopped>`, `--verbose`；输出项目 ID、路径、状态、最近索引时间、worker PID；对应 `ProjectListRequest`。详细拆解见 @/docs/features/backend-service/project-list.md。
 - **project status**：参数 `--project`, `--json`, `--fields`；展示单项目的 worker 状态、索引进度、watcher、最近请求、向量库版本；对应 `ProjectStatusRequest`。详细拆解见 @/docs/features/backend-service/project-status.md。
-- **项目/守护进程日志（`code-nav logs`）**：详细规范见 @/docs/features/backend-service/logs.md，核心要求包括：
+- **扩展命令（可选）**：保留 `project start/stop`, `project inspect`, `project sync` 等拓展点，对应未来协议；CLI 输出应保持一致的帮助文本/示例/退出码，并支持 `--json` 模式供脚本使用。
+- **project restart**：参数 `--project`, `--wait`, `--grace`, `--force`, `--timeout`, `--reason`；执行单项目 stop→start，复用 restart 流程，映射 `RestartRequest(scope=project)`；详见 @/docs/features/backend-service/project-restart.md。
+- **扩展命令（可选）**：保留 `project start/stop`, `project logs`, `project inspect`, `project sync` 等拓展点，对应未来协议；CLI 输出应保持一致的帮助文本/示例/退出码，并支持 `--json` 模式供脚本使用。
+
+## 12. 项目/守护进程日志（`code-nav logs`）
+详细规范见 @/docs/features/backend-service/logs.md，核心要求包括：
   - **统一 CLI 入口**：`code-nav logs --target <master|worker> --project <id|path> --since <duration|RFC3339> --limit <n> --follow --json --color auto|always|never --level <trace|...>`；worker 目标必须带项目引用，`--limit` 默认 500。
   - **时间/输出控制**：支持相对/绝对 `--since`、`--follow-interval`、文本（带颜色）与 JSON 两种输出模式，文本按 `[timestamp][LEVEL][source] message` 对齐，JSON 直接输出 `LogEvent`。
   - **日志聚合服务**：master 内置 `LogsService`（ring buffer + 可选落盘 + worker broadcast 通道），提供 `LogsHistory` 与 `LogsStream` RPC，负责过滤 `since/limit/level` 并向多个订阅者广播。
   - **错误与退出码**：统一 `ProjectNotFound/WorkerOffline/FollowTimeout/...` 错误结构，CLI 退出码 `0/2/3/1` 区分成功、项目不存在、follow 超时/中断与其他错误，`--json` 模式输出 `{ "error": { ... } }`。
-- **扩展命令（可选）**：保留 `project start/stop`, `project inspect`, `project sync` 等拓展点，对应未来协议；CLI 输出应保持一致的帮助文本/示例/退出码，并支持 `--json` 模式供脚本使用。
+
