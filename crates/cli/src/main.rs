@@ -1,6 +1,11 @@
+mod client;
+mod commands;
+mod formatter;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use code_nav_protocol::{ListKind, Request};
+use commands::project::{self, ProjectCommand};
 
 #[derive(Parser)]
 #[command(name = "code-nav", version, about = "code navigation cli")]
@@ -20,6 +25,10 @@ enum Commands {
         #[arg(value_enum)]
         kind: Kind,
     },
+    Project {
+        #[command(subcommand)]
+        action: ProjectCommand,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -32,9 +41,11 @@ enum Kind {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
     let cli = Cli::parse();
-    let request = match cli.command {
+    match cli.command {
         Commands::Search { query, top_k } => {
-            Request::Search(code_nav_protocol::SearchRequest { query, top_k })
+            let request = Request::Search(code_nav_protocol::SearchRequest { query, top_k });
+            // TODO: send request to server; placeholder prints JSON.
+            println!("{}", serde_json::to_string(&request)?);
         }
         Commands::List { kind } => {
             let list_kind = match kind {
@@ -42,15 +53,17 @@ fn main() -> Result<()> {
                 Kind::Methods => ListKind::Methods,
                 Kind::Files => ListKind::Files,
             };
-            Request::List(code_nav_protocol::ListRequest {
+            let request = Request::List(code_nav_protocol::ListRequest {
                 kind: list_kind,
                 filter: None,
                 limit: None,
-            })
+            });
+            // TODO: send request to server; placeholder prints JSON.
+            println!("{}", serde_json::to_string(&request)?);
         }
-    };
-
-    // TODO: send request to server; placeholder prints JSON.
-    println!("{}", serde_json::to_string(&request)?);
+        Commands::Project { action } => {
+            project::run(action)?;
+        }
+    }
     Ok(())
 }
