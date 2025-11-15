@@ -18,4 +18,24 @@ cargo fmt
 cargo build
 ```
 
+构建完成后会在 `target/debug/code-nav`（或 release 模式对应路径）下生成 CLI 可执行文件。可以通过以下命令查看已经接入的 `project` 子命令：
+
+```bash
+cargo run -p code-nav-cli -- project --help
+```
+
+示例输出：
+
+```
+Usage: code-nav project <COMMAND>
+
+Commands:
+  add      Register a project and schedule worker initialization
+  remove   Remove a project from the registry
+  list     List registered projects and their runtime state
+  status   Show detailed runtime information for a single project
+  restart  Restart one or multiple project workers
+  help     Print this message or the help of the given subcommand(s)
+```
+
 后续可在各 crate 中逐步替换占位实现，接入 tree-sitter、embedding 后端、HNSW 向量库等真实逻辑。

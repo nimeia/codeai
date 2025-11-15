@@ -44,6 +44,9 @@ pub struct ProjectAddArgs {
     /// Optional custom project identifier.
     #[arg(long = "id")]
     pub id: Option<String>,
+    /// Override the default runtime directory (~/.code-nav).
+    #[arg(long = "runtime-dir", value_name = "PATH")]
+    pub runtime_dir: Option<PathBuf>,
     /// Mark the project for automatic start when master launches.
     #[arg(long)]
     pub autostart: bool,
@@ -66,6 +69,9 @@ pub struct ProjectRemoveArgs {
     /// Path or identifier of the project to remove.
     #[arg(long = "project", value_name = "PATH|ID", value_parser = NonEmptyStringValueParser::new())]
     pub project: String,
+    /// Override the default runtime directory (~/.code-nav).
+    #[arg(long = "runtime-dir", value_name = "PATH")]
+    pub runtime_dir: Option<PathBuf>,
     /// Force stop the worker if it does not shut down cleanly.
     #[arg(long = "force")]
     pub force: bool,
@@ -85,6 +91,9 @@ pub struct ProjectListArgs {
     /// Output format for the list command.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+    /// Override the default runtime directory (~/.code-nav).
+    #[arg(long = "runtime-dir", value_name = "PATH")]
+    pub runtime_dir: Option<PathBuf>,
     /// Filter projects by runtime status.
     #[arg(long = "status", value_enum)]
     pub status: Option<ProjectRuntimeFilter>,
@@ -98,6 +107,9 @@ pub struct ProjectStatusArgs {
     /// Path or identifier of the project to inspect.
     #[arg(long = "project", value_name = "PATH|ID", value_parser = NonEmptyStringValueParser::new())]
     pub project: String,
+    /// Override the default runtime directory (~/.code-nav).
+    #[arg(long = "runtime-dir", value_name = "PATH")]
+    pub runtime_dir: Option<PathBuf>,
     /// Comma separated list of fields to include.
     #[arg(long = "fields")]
     pub fields: Option<String>,
@@ -119,6 +131,9 @@ pub struct ProjectRestartArgs {
         value_parser = NonEmptyStringValueParser::new()
     )]
     pub project: Vec<String>,
+    /// Override the default runtime directory (~/.code-nav).
+    #[arg(long = "runtime-dir", value_name = "PATH")]
+    pub runtime_dir: Option<PathBuf>,
     /// Wait for the restart workflow to finish.
     #[arg(long = "wait")]
     pub wait: bool,
@@ -183,7 +198,7 @@ const REGISTRY_VERSION: u32 = 1;
 
 fn handle_add(args: ProjectAddArgs) -> Result<()> {
     let project_root = normalize_project_path(&args.project)?;
-    let mut registry = ProjectRegistry::load()?;
+    let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
 
     if registry.contains_path(&project_root) {
         bail!("project {} is already registered", project_root.display());
@@ -228,7 +243,7 @@ fn handle_add(args: ProjectAddArgs) -> Result<()> {
 }
 
 fn handle_remove(args: ProjectRemoveArgs) -> Result<()> {
-    let mut registry = ProjectRegistry::load()?;
+    let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let removed = registry
         .remove(&args.project)
         .with_context(|| format!("no project matched reference '{}'", args.project))?;
@@ -261,7 +276,7 @@ fn handle_remove(args: ProjectRemoveArgs) -> Result<()> {
 }
 
 fn handle_list(args: ProjectListArgs) -> Result<()> {
-    let registry = ProjectRegistry::load()?;
+    let registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let mut entries = registry
         .entries()
         .iter()
@@ -288,7 +303,7 @@ fn handle_status(args: ProjectStatusArgs) -> Result<()> {
         formatter::print_line("TODO: implement --watch to stream project status");
     }
 
-    let registry = ProjectRegistry::load()?;
+    let registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let entry = registry
         .find(&args.project)
         .with_context(|| format!("no project matched reference '{}'", args.project))?;
@@ -324,7 +339,7 @@ fn handle_status(args: ProjectStatusArgs) -> Result<()> {
 }
 
 fn handle_restart(args: ProjectRestartArgs) -> Result<()> {
-    let mut registry = ProjectRegistry::load()?;
+    let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let mut updated = Vec::new();
     for reference in &args.project {
         let entry = registry
@@ -414,8 +429,8 @@ struct ProjectRegistry {
 }
 
 impl ProjectRegistry {
-    fn load() -> Result<Self> {
-        let path = registry_path()?;
+    fn load(runtime_dir_override: Option<&Path>) -> Result<Self> {
+        let path = registry_path(runtime_dir_override)?;
         if !path.exists() {
             let file = RegistryFile::default();
             let json = serde_json::to_vec_pretty(&file)?;
@@ -529,9 +544,13 @@ fn normalize_project_path_optional(reference: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn registry_path() -> Result<PathBuf> {
-    let home = home_dir().ok_or_else(|| anyhow!("failed to determine home directory"))?;
-    let runtime_dir = home.join(".code-nav");
+fn registry_path(runtime_dir_override: Option<&Path>) -> Result<PathBuf> {
+    let runtime_dir = if let Some(custom) = runtime_dir_override {
+        custom.to_path_buf()
+    } else {
+        let home = home_dir().ok_or_else(|| anyhow!("failed to determine home directory"))?;
+        home.join(".code-nav")
+    };
     let projects_dir = runtime_dir.join("projects");
     fs::create_dir_all(&projects_dir)?;
     Ok(projects_dir.join("registry.json"))
