@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::NonEmptyStringValueParser, Args, Subcommand, ValueEnum};
 use code_nav_protocol::{
     IndexMode, ProjectAddRequest, ProjectListRequest, ProjectRef, ProjectRemoveRequest,
-    ProjectRestartRequest, ProjectStatusRequest, Request,
+    ProjectRestartRequest, Request, StatusRequest, StatusResponse, WorkerStatus,
 };
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
@@ -114,9 +114,6 @@ pub struct ProjectStatusArgs {
     /// Override the default runtime directory (~/.code-nav).
     #[arg(long = "runtime-dir", value_name = "PATH")]
     pub runtime_dir: Option<PathBuf>,
-    /// Comma separated list of fields to include.
-    #[arg(long = "fields")]
-    pub fields: Option<String>,
     /// Continuously refresh the status output at the given interval.
     #[arg(long = "watch", value_name = "SECONDS")]
     pub watch: Option<u64>,
@@ -253,7 +250,7 @@ fn handle_add(args: ProjectAddArgs) -> Result<()> {
         model: args.model.clone(),
     });
     let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload);
+    client::send_request(&payload)?;
 
     let entry = ProjectEntry {
         project_id: project_id.clone(),
@@ -291,7 +288,7 @@ fn handle_remove(args: ProjectRemoveArgs) -> Result<()> {
         grace_sec: args.grace,
     });
     let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload);
+    client::send_request(&payload)?;
 
     let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let removed = registry
@@ -318,7 +315,7 @@ fn handle_list(args: ProjectListArgs) -> Result<()> {
         status: args.status.map(to_protocol_project_runtime_filter),
     });
     let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload);
+    client::send_request(&payload)?;
     formatter::print_line("List request sent to master daemon. Showing local cache.");
 
     let registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
@@ -346,48 +343,72 @@ fn handle_list(args: ProjectListArgs) -> Result<()> {
 fn handle_status(args: ProjectStatusArgs) -> Result<()> {
     if args.watch.is_some() {
         formatter::print_line("TODO: implement --watch to stream project status");
-    }
-
-    let request = Request::ProjectStatus(ProjectStatusRequest {
-        project: to_protocol_project_ref(&args.project),
-    });
-    let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload);
-    formatter::print_line("Status request sent to master daemon. Showing local cache.");
-
-    let registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
-    let entry = registry
-        .find(&args.project)
-        .with_context(|| format!("no project matched reference '{}'", args.project))?;
-    let snapshot = ProjectSnapshot::from_project_entry(entry);
-
-    if args.json {
-        formatter::print_line(&serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
 
-    let requested_fields = parse_status_fields(args.fields.as_deref());
-    for field in requested_fields {
-        match field {
-            StatusField::Meta => formatter::print_line(&format!(
-                "Project: {} ({})",
-                snapshot.project_id,
-                snapshot.project_root.display()
-            )),
-            StatusField::State => formatter::print_line(&format!("State: {}", snapshot.state)),
-            StatusField::Policy => {
-                formatter::print_line(&format!(
-                    "Policy: autostart={} watch={} index_mode={:?}",
-                    snapshot.autostart, snapshot.watch, snapshot.index_mode
-                ));
-                if let Some(model) = &snapshot.model {
-                    formatter::print_line(&format!("Model: {model}"));
-                }
+    let project_ref = to_protocol_project_ref(&args.project);
+    let request = Request::Status(StatusRequest {
+        target: Some(project_ref),
+    });
+    let payload = serde_json::to_string(&request)?;
+
+    if let Some(response_payload) = client::send_request(&payload)? {
+        let response: code_nav_protocol::Response = serde_json::from_str(&response_payload)
+            .context("failed to deserialize response from server")?;
+
+        if let code_nav_protocol::Response::Status(StatusResponse::Worker(worker_status)) = response
+        {
+            if args.json {
+                formatter::print_line(&serde_json::to_string_pretty(&worker_status)?);
+            } else {
+                print_worker_status(worker_status);
             }
+        } else {
+            formatter::print_line("Error: received unexpected response type from server");
         }
     }
-    formatter::print_line("TODO: enrich status with worker/indexing metrics once master is ready");
+
     Ok(())
+}
+
+fn print_worker_status(status: WorkerStatus) {
+    let summary = status.summary;
+    formatter::print_line(&format!(
+        "Project: {} ({})",
+        summary.project_id,
+        summary.project_root.display()
+    ));
+
+    let status_string = match status.indexer_state.state {
+        code_nav_protocol::WorkerState::Indexing => {
+            if let Some(percent) = status.indexer_state.progress_percent {
+                format!("Indexing ({:.1}%)", percent)
+            } else {
+                "Indexing".to_string()
+            }
+        }
+        _ => serde_json::to_string(&summary.status).unwrap_or_default(),
+    };
+    formatter::print_line(&format!("{:<12} {}", "Status:", status_string));
+
+    if let Some(file) = status.indexer_state.current_file {
+        if !file.is_empty() {
+            formatter::print_line(&format!("{:<12} {}", "File:", file));
+        }
+    }
+
+    formatter::print_line(&format!(
+        "{:<12} {}",
+        "Uptime:",
+        formatter::format_uptime(summary.uptime_secs)
+    ));
+
+    let watcher_status = if status.is_watching { "Active" } else { "Inactive" };
+    formatter::print_line(&format!("{:<12} {}", "Watcher:", watcher_status));
+    formatter::print_line(&format!(
+        "{:<12} {} tasks pending",
+        "Queue:", status.task_queue_size
+    ));
 }
 
 fn handle_restart(args: ProjectRestartArgs) -> Result<()> {
@@ -404,7 +425,7 @@ fn handle_restart(args: ProjectRestartArgs) -> Result<()> {
         reason: args.reason.clone(),
     });
     let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload);
+    client::send_request(&payload)?;
 
     let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let mut updated = Vec::new();

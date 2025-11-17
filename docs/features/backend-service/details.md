@@ -82,10 +82,63 @@
 - CLI：`code-nav tree --project <path> [path] --depth 3 --include-hidden`。
 - 行为：返回目录树与文件类型信息，供 CLI 渲染。
 
-## 9. 运行状态与信息
-- API：`/status`、`/info`。
-- CLI：`code-nav status --project <path>` 查询单个 worker；`code-nav info --project <path>` 查看项目信息；`code-nav project status` 查看 master + 所有 worker。
-- 行为：`status` 报告索引进度、队列、健康；`info` 回传版本、协议、模型、配置。
+## 9. 运行状态与信息 (Runtime Status and Information)
+
+详细设计: 
+- @/docs/features/backend-service/info.md
+- @/docs/features/backend-service/status.md
+
+**1. 协议层设计 (`protocol` crate)**
+*   **1.1. 基础信息 (`Info`)**
+    *   **请求**: `Request::Info` (可携带可选的 `project_ref` 来定位目标)。
+    *   **响应**: `Response::Info(InfoResponse)`，包含：
+        *   `protocol_version`: 协议版本。
+        *   `server_version`: 服务端版本。
+        *   `role`: 角色 ("master" 或 "worker")。
+        *   `project_id` / `project_root`: (仅 Worker) 项目信息。
+        *   `config_summary`: (可选) 关键配置摘要。
+
+*   **1.2. 动态状态 (`Status`)**
+    *   **请求**: `Request::Status` (可携带可选的 `project_ref` 来定位目标)。
+    *   **响应**: `Response::Status(StatusResponse)`，包含一个枚举：
+        *   `Master(MasterStatus)`:
+            *   `pid`: Master 进程 ID。
+            *   `uptime_secs`: 运行时长。
+            *   `worker_summary`: 所有 Worker 的状态摘要列表 (`Vec<WorkerSummary>`)。
+        *   `Worker(WorkerStatus)`:
+            *   `pid`: Worker 进程 ID。
+            *   `uptime_secs`: 运行时长。
+            *   `indexer_state`: 索引器状态 (如 "idle", "indexing", "paused")。
+            *   `indexed_files_count`: 已索引文件数。
+            *   `task_queue_size`: 待处理任务数。
+
+**2. CLI 设计 (`cli` crate)**
+*   **2.1. `code-nav info`**
+    *   **功能**: 获取 Master 守护进程的基础信息。
+    *   **输出**: 简洁的键值对，如版本、协议、运行时长等。
+
+*   **2.2. `code-nav status`**
+    *   **功能**: 以列表形式展示 Master 和所有 Worker 的摘要状态，类似 `docker ps`。
+    *   **输出**: 表格，包含 `ID`, `Path`, `Status`, `Indexed Files`, `Uptime` 等列。
+
+*   **2.3. `code-nav project status <project>`**
+    *   **功能**: 获取单个项目的详细运行状态。
+    *   **输出**: 详细的键值对列表，包含索引进度、任务队列、文件监听状态等。
+
+**3. Master 守护进程设计 (`server` crate)**
+*   **3.1. 状态聚合**:
+    *   在内存中维护所有 Worker 的最新状态摘要。
+    *   通过心跳机制或定期轮询从 Worker 处更新这些信息。
+*   **3.2. 请求路由**:
+    *   收到无目标的 `status` 或 `info` 请求时，返回自身和所有 Worker 的聚合信息。
+    *   收到带项目目标的请求时，将其准确转发给对应的 Worker 进程处理。
+
+**4. Worker 进程设计 (`server` crate)**
+*   **4.1. 状态收集**:
+    *   在自身内存中实时维护索引器、任务队列等模块的详细状态。
+*   **4.2. 状态上报与响应**:
+    *   响应 Master 的状态查询请求，返回详细的自身状态。
+    *   (可选) 主动向 Master 发送心跳，报告健康状况和关键指标。
 
 ## 10. 配置 & 模型管理（扩展）
 - CLI：`code-nav config set <key> <value>`、`code-nav config get <key>`、`code-nav models list`、`code-nav models select <name>`（可带 `--project` 针对特定 worker，或不带针对 master/global）。

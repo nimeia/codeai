@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "payload")]
 pub enum Request {
-    Info,
-    Status,
+    Info(InfoRequest),
+    Status(StatusRequest),
     Search(SearchRequest),
     Goto(GotoRequest),
     List(ListRequest),
@@ -48,14 +48,18 @@ pub struct Envelope<T> {
     pub data: T,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct InfoResponse {
-    pub protocol_version: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InfoResponse {
+    Master(MasterInfo),
+    Worker(WorkerInfo),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StatusResponse {
-    pub ready: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusResponse {
+    Master(MasterStatus),
+    Worker(WorkerStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,4 +295,78 @@ pub enum ProjectRuntimeFilter {
     Running,
     Stopped,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfoRequest {
+    pub target: Option<ProjectRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MasterInfo {
+    pub protocol_version: String,
+    pub server_version: String,
+    pub pid: u32,
+    pub uptime_secs: u64,
+    pub projects_managed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerInfo {
+    pub protocol_version: String,
+    pub server_version: String,
+    pub project_id: String,
+    pub project_root: PathBuf,
+    pub pid: u32,
+    pub uptime_secs: u64,
+    pub config_summary: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusRequest {
+    pub target: Option<ProjectRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MasterStatus {
+    pub pid: u32,
+    pub uptime_secs: u64,
+    pub workers: Vec<WorkerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerSummary {
+    pub project_id: String,
+    pub project_root: PathBuf,
+    pub pid: u32,
+    pub status: WorkerState,
+    pub indexed_files_count: u64,
+    pub uptime_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStatus {
+    pub summary: WorkerSummary,
+    pub indexer_state: IndexerState,
+    pub task_queue_size: usize,
+    pub is_watching: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    Running,
+    Idle,
+    Indexing,
+    Paused,
+    Failed,
+    Starting,
+    Stopping,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexerState {
+    pub state: WorkerState,
+    pub progress_percent: Option<f32>,
+    pub current_file: Option<String>,
 }

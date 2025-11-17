@@ -10,7 +10,7 @@ fn get_socket_path() -> Result<PathBuf> {
     Ok(runtime_dir.join("master.sock"))
 }
 
-pub fn send_request(payload: &str) -> Result<()> {
+pub fn send_request(payload: &str) -> Result<Option<String>> {
     let socket_path = get_socket_path()?;
     match UnixStream::connect(&socket_path) {
         Ok(mut stream) => {
@@ -19,17 +19,12 @@ pub fn send_request(payload: &str) -> Result<()> {
                 .write_all(payload.as_bytes())
                 .context("failed to write to socket")?;
 
-            // For now, we don't expect a response, or the response is handled elsewhere.
-            // In a real implementation, we would read the response here.
             let mut response = String::new();
             stream
                 .read_to_string(&mut response)
                 .context("failed to read from socket")?;
             tracing::debug!(response, "received response");
-            // TODO: Deserialize and handle the response properly.
-            println!("Response from server (raw): {}", response);
-
-            Ok(())
+            Ok(Some(response))
         }
         Err(e) => {
             tracing::warn!(
@@ -37,11 +32,8 @@ pub fn send_request(payload: &str) -> Result<()> {
                 socket_path.display(),
                 e
             );
-            // This is not a critical error for now, as the server is not implemented.
-            // The CLI commands still perform local actions.
-            // In the future, this might become a hard error for most commands.
             println!("Note: Could not connect to code-nav daemon. Operations will be local-only.");
-            Ok(())
+            Ok(None)
         }
     }
 }
