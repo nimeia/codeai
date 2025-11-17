@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,13 @@ pub enum Request {
     List(ListRequest),
     Index(IndexRequest),
     Logs(LogsRequest),
+
+    // Project management
+    ProjectAdd(ProjectAddRequest),
+    ProjectRemove(ProjectRemoveRequest),
+    ProjectList(ProjectListRequest),
+    ProjectStatus(ProjectStatusRequest),
+    ProjectRestart(ProjectRestartRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +33,13 @@ pub enum Response {
     Index(IndexResponse),
     Logs(LogsResponse),
     Error(ErrorBody),
+
+    // Project management
+    ProjectAdd(ProjectAddResponse),
+    ProjectRemove(ProjectRemoveResponse),
+    ProjectList(ProjectListResponse),
+    ProjectStatus(ProjectStatusResponse),
+    ProjectRestart(ProjectRestartResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,4 +204,91 @@ pub struct ListItem {
 pub enum IndexMode {
     Full,
     Incremental,
+    Auto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectAddRequest {
+    pub project_root: PathBuf,
+    pub id: Option<String>,
+    pub autostart: bool,
+    pub watch: bool,
+    pub index_mode: IndexMode,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectAddResponse {
+    pub project_id: String,
+    pub project_root: PathBuf,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRemoveRequest {
+    pub project: ProjectRef,
+    pub force: bool,
+    pub keep_data: bool,
+    pub grace_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRemoveResponse {
+    pub project_id: String,
+    pub project_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectListRequest {
+    pub status: Option<ProjectRuntimeFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectListResponse {
+    pub projects: Vec<ProjectInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectStatusRequest {
+    pub project: ProjectRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectStatusResponse {
+    pub info: ProjectInfo,
+    // pub metrics: ... // TODO: Add metrics later
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRestartRequest {
+    pub projects: Vec<ProjectRef>,
+    pub wait: bool,
+    pub force: bool,
+    pub grace_sec: Option<u64>,
+    pub timeout_sec: Option<u64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRestartResponse {
+    pub projects: Vec<ProjectInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectInfo {
+    pub project_id: String,
+    pub project_root: PathBuf,
+    pub autostart: bool,
+    pub watch: bool,
+    pub index_mode: IndexMode,
+    pub model: Option<String>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRuntimeFilter {
+    Running,
+    Stopped,
+    Failed,
 }

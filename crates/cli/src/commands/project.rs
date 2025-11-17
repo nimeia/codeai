@@ -7,10 +7,14 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::NonEmptyStringValueParser, Args, Subcommand, ValueEnum};
+use code_nav_protocol::{
+    IndexMode, ProjectAddRequest, ProjectListRequest, ProjectRef, ProjectRemoveRequest,
+    ProjectRestartRequest, ProjectStatusRequest, Request,
+};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 
-use crate::formatter;
+use crate::{client, formatter};
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
@@ -194,6 +198,32 @@ impl fmt::Display for ProjectRuntimeFilter {
     }
 }
 
+fn to_protocol_index_mode(mode: IndexModeArg) -> IndexMode {
+    match mode {
+        IndexModeArg::Full => IndexMode::Full,
+        IndexModeArg::Incremental => IndexMode::Incremental,
+        IndexModeArg::Auto => IndexMode::Auto,
+    }
+}
+
+fn to_protocol_project_ref(reference: &str) -> ProjectRef {
+    if Path::new(reference).exists() {
+        ProjectRef::Path(reference.to_string())
+    } else {
+        ProjectRef::Id(reference.to_string())
+    }
+}
+
+fn to_protocol_project_runtime_filter(
+    filter: ProjectRuntimeFilter,
+) -> code_nav_protocol::ProjectRuntimeFilter {
+    match filter {
+        ProjectRuntimeFilter::Running => code_nav_protocol::ProjectRuntimeFilter::Running,
+        ProjectRuntimeFilter::Stopped => code_nav_protocol::ProjectRuntimeFilter::Stopped,
+        ProjectRuntimeFilter::Failed => code_nav_protocol::ProjectRuntimeFilter::Failed,
+    }
+}
+
 const REGISTRY_VERSION: u32 = 1;
 
 fn handle_add(args: ProjectAddArgs) -> Result<()> {
@@ -213,6 +243,17 @@ fn handle_add(args: ProjectAddArgs) -> Result<()> {
     if registry.contains_id(&project_id) {
         bail!("project id {project_id} already exists; supply --id with a unique value");
     }
+
+    let request = Request::ProjectAdd(ProjectAddRequest {
+        project_root: project_root.clone(),
+        id: args.id.clone(),
+        autostart: args.autostart,
+        watch: args.watch,
+        index_mode: to_protocol_index_mode(args.index_mode),
+        model: args.model.clone(),
+    });
+    let payload = serde_json::to_string(&request)?;
+    client::send_request(&payload);
 
     let entry = ProjectEntry {
         project_id: project_id.clone(),
@@ -237,12 +278,21 @@ fn handle_add(args: ProjectAddArgs) -> Result<()> {
             snapshot.project_root.display()
         ));
         formatter::print_line("Worker: initializing (pending)");
-        formatter::print_line("TODO: connect to master control socket to start worker");
+        formatter::print_line("Add request sent to master daemon.");
     }
     Ok(())
 }
 
 fn handle_remove(args: ProjectRemoveArgs) -> Result<()> {
+    let request = Request::ProjectRemove(ProjectRemoveRequest {
+        project: to_protocol_project_ref(&args.project),
+        force: args.force,
+        keep_data: args.keep_data,
+        grace_sec: args.grace,
+    });
+    let payload = serde_json::to_string(&request)?;
+    client::send_request(&payload);
+
     let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let removed = registry
         .remove(&args.project)
@@ -258,24 +308,19 @@ fn handle_remove(args: ProjectRemoveArgs) -> Result<()> {
             removed.project_id,
             removed.project_root.display()
         ));
-        formatter::print_line("TODO: stop worker and reclaim runtime resources");
-        if args.keep_data {
-            formatter::print_line("Data: kept (will be deleted when master integration lands)");
-        } else {
-            formatter::print_line("Data: delete scheduled (requires worker support)");
-        }
-        if args.force {
-            formatter::print_line("Note: --force currently only updates registry metadata");
-        }
-        formatter::print_line(&format!(
-            "Grace period requested: {}s (not yet applied)",
-            args.grace
-        ));
+        formatter::print_line("Remove request sent to master daemon.");
     }
     Ok(())
 }
 
 fn handle_list(args: ProjectListArgs) -> Result<()> {
+    let request = Request::ProjectList(ProjectListRequest {
+        status: args.status.map(to_protocol_project_runtime_filter),
+    });
+    let payload = serde_json::to_string(&request)?;
+    client::send_request(&payload);
+    formatter::print_line("List request sent to master daemon. Showing local cache.");
+
     let registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let mut entries = registry
         .entries()
@@ -302,6 +347,13 @@ fn handle_status(args: ProjectStatusArgs) -> Result<()> {
     if args.watch.is_some() {
         formatter::print_line("TODO: implement --watch to stream project status");
     }
+
+    let request = Request::ProjectStatus(ProjectStatusRequest {
+        project: to_protocol_project_ref(&args.project),
+    });
+    let payload = serde_json::to_string(&request)?;
+    client::send_request(&payload);
+    formatter::print_line("Status request sent to master daemon. Showing local cache.");
 
     let registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let entry = registry
@@ -339,6 +391,21 @@ fn handle_status(args: ProjectStatusArgs) -> Result<()> {
 }
 
 fn handle_restart(args: ProjectRestartArgs) -> Result<()> {
+    let request = Request::ProjectRestart(ProjectRestartRequest {
+        projects: args
+            .project
+            .iter()
+            .map(|p| to_protocol_project_ref(p))
+            .collect(),
+        wait: args.wait,
+        force: args.force,
+        grace_sec: args.grace,
+        timeout_sec: args.timeout,
+        reason: args.reason.clone(),
+    });
+    let payload = serde_json::to_string(&request)?;
+    client::send_request(&payload);
+
     let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let mut updated = Vec::new();
     for reference in &args.project {
@@ -363,18 +430,11 @@ fn handle_restart(args: ProjectRestartArgs) -> Result<()> {
         for project in &args.project {
             formatter::print_line(&format!("  - {project}"));
         }
-        formatter::print_line("TODO: signal master to stop/start workers and honor --wait/--force");
-        if args.wait || args.force || args.grace.is_some() || args.timeout.is_some() {
-            formatter::print_line(
-                "Note: restart flags are recorded locally but require master integration",
-            );
-        }
-        if let Some(reason) = &args.reason {
-            formatter::print_line(&format!("Reason: {reason}"));
-        }
+        formatter::print_line("Restart request sent to master daemon.");
     }
     Ok(())
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegistryFile {
