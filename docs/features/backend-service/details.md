@@ -3,7 +3,7 @@
 ## 1. 总览任务
 1. Master 启动流程（`code-navd start`）：定义配置结构、控制端点创建、前台/后台模式、日志初始化。
 2. 项目注册与 worker 管理（`project add/remove/list/status/restart/stop`）：设计 registry、worker 启停、自动重启/回收策略。
-3. IPC 协议扩展：在 protocol crate 中增加 master↔worker、CLI↔master 的请求/响应类型。
+3. IPC 协议扩展：在 protocol crate 中增加 master↔worker、CLI↔master 的请求/响应类型。详细设计参见 @/docs/features/backend-service/communication-protocol.md。
 4. 索引/搜索 API 适配 master：明确 CLI `search/list/goto/tree/index/status/info` 的 `--project` 参数和路由逻辑。
 5. Worker 生命周期细节：整理项目级启动/停止步骤（配置校验、锁文件、资源加载、watcher、信号处理）。
 6. 日志与监控方案：规划 master/worker 日志级别、输出目录、轮转与 metrics/健康检查。

@@ -3,8 +3,11 @@ use std::{fmt, path::Path};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
-use code_nav_protocol::{LogLevel, LogOutputFormat, LogTarget, LogsRequest, ProjectRef};
-use serde::Serialize;
+use code_nav_protocol::{LogLevel, LogOutputFormat, LogTarget, LogsRequest, ProjectRef, Request};
+
+
+use crate::formatter;
+use crate::CliContext; // Add CliContext
 
 #[derive(Debug, Args)]
 pub struct LogsArgs {
@@ -84,14 +87,9 @@ impl fmt::Display for ColorChoice {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct LogsPreview<'a> {
-    #[serde(flatten)]
-    request: &'a LogsRequest,
-    color: String,
-}
+// LogsPreview is removed
 
-pub fn run(args: LogsArgs) -> Result<()> {
+pub fn run(ctx: &CliContext, args: LogsArgs) -> Result<()> {
     if args.limit == 0 {
         bail!("--limit 必须为正数");
     }
@@ -101,7 +99,7 @@ pub fn run(args: LogsArgs) -> Result<()> {
         Some(value) => Some(parse_since(value)?),
         None => None,
     };
-    let request = LogsRequest {
+    let request_payload = LogsRequest {
         target,
         since,
         limit: Some(limit),
@@ -115,11 +113,24 @@ pub fn run(args: LogsArgs) -> Result<()> {
         },
     };
 
-    let preview = LogsPreview {
-        request: &request,
-        color: args.color.to_string(),
-    };
-    println!("{}", serde_json::to_string_pretty(&preview)?);
+    let response = ctx.client.send(&Request::Logs(request_payload))?;
+
+    if let code_nav_protocol::Response::Logs(logs_response) = response {
+        if args.json {
+            formatter::print_line(&serde_json::to_string_pretty(&logs_response)?);
+        } else {
+            // Placeholder: just print messages for now.
+            for event in logs_response.events {
+                formatter::print_line(&format!(
+                    "[{:?}] {}: {}",
+                    event.level, event.source, event.message
+                ));
+            }
+        }
+    } else {
+        bail!("Error: received unexpected response type from server");
+    }
+
     Ok(())
 }
 
@@ -152,18 +163,18 @@ fn parse_since(value: &str) -> Result<i64> {
 
     let trimmed = value.trim().to_ascii_lowercase();
     if trimmed.len() < 2 {
-        bail!("无法解析 --since: {value}");
+        bail!("无法解析 --since: {{value}}");
     }
     let (number, unit) = trimmed.split_at(trimmed.len() - 1);
     let quantity: i64 = number
         .parse()
-        .with_context(|| format!("无法解析持续时间 {number}"))?;
+        .with_context(|| format!("无法解析持续时间 {{number}}"))?;
     let seconds = match unit {
         "s" => quantity,
         "m" => quantity * 60,
         "h" => quantity * 60 * 60,
         "d" => quantity * 60 * 60 * 24,
-        _ => bail!("未知时间单位: {unit}"),
+        _ => bail!("未知时间单位: {{unit}}"),
     };
     Ok(Utc::now().timestamp() - seconds)
 }

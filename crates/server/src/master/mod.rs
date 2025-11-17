@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     ffi::OsStr,
     fs::{self, File},
     io::{self, Write},
@@ -14,13 +14,19 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use axum::{routing::post, Json, Router};
 use cfg_if::cfg_if;
 use chrono::Utc;
 use clap::ValueEnum;
+use code_nav_protocol::{
+    InfoResponse, MasterInfo, Request, Response, StatusResponse, MasterStatus,
+};
 use fslock::LockFile;
 use is_terminal::IsTerminal;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn, Level};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter::LevelFilter;
@@ -55,7 +61,7 @@ pub struct RestartCommand {
     pub stop: StopCommand,
 }
 
-pub fn run_start(args: StartCommand) -> Result<()> {
+pub async fn run_start(args: StartCommand) -> Result<()> {
     let config = MasterConfig::load(&args)?;
     let _lock = MasterLock::acquire(&config)?;
     let logging = LoggingGuards::init(&config)?;
@@ -73,12 +79,11 @@ pub fn run_start(args: StartCommand) -> Result<()> {
         warn!("后台模式尚未实现，当前进程将以前台模式运行");
     }
 
-    let endpoint = setup_control_endpoint(&config)?;
     let registry = ProjectRegistry::load(&config)?;
     apply_autostart(&config, &registry)?;
 
     print_start_feedback(&config, &registry);
-    run_main_loop(&config, endpoint, logging)
+    run_main_loop(&config, logging).await
 }
 
 pub fn run_stop(args: StopCommand) -> Result<()> {
@@ -89,18 +94,17 @@ pub fn run_stop(args: StopCommand) -> Result<()> {
             "code-navd 未在运行（未找到运行目录 {:?}）",
             config.runtime_dir
         );
-        return Ok(());
+        return Ok(())
     }
 
     let pid_info = match read_pid_file(&config.pid_path) {
         Ok(info) => info,
         Err(err)
-            if err.downcast_ref::<io::Error>().map(|e| e.kind())
-                == Some(io::ErrorKind::NotFound) =>
+            if err.downcast_ref::<io::Error>().map(|e| e.kind()) == Some(io::ErrorKind::NotFound) =>
         {
             println!("code-navd 未在运行（未找到 PID 文件）");
             cleanup_runtime_artifacts(&config)?;
-            return Ok(());
+            return Ok(())
         }
         Err(err) => {
             return Err(err).context("无法读取 master.pid");
@@ -112,19 +116,19 @@ pub fn run_stop(args: StopCommand) -> Result<()> {
         None => {
             println!("PID 文件缺少进程信息，视为未运行");
             cleanup_runtime_artifacts(&config)?;
-            return Ok(());
+            return Ok(())
         }
     };
 
     if !config.assume_yes && !confirm_stop()? {
         println!("已取消停止操作");
-        return Ok(());
+        return Ok(())
     }
 
     if !is_process_alive(pid) {
         println!("code-navd 不在运行（PID {pid} 不存在），清理残留文件");
         cleanup_runtime_artifacts(&config)?;
-        return Ok(());
+        return Ok(())
     }
 
     println!("发送停止请求（PID {pid}）...");
@@ -137,7 +141,7 @@ pub fn run_stop(args: StopCommand) -> Result<()> {
         if !is_process_alive(pid) {
             println!("停止成功，PID {pid} 已退出");
             cleanup_runtime_artifacts(&config)?;
-            return Ok(());
+            return Ok(())
         }
 
         if config.force && !forced && start.elapsed() >= config.grace {
@@ -160,16 +164,15 @@ pub fn run_stop(args: StopCommand) -> Result<()> {
     }
 }
 
-pub fn run_restart(cmd: RestartCommand) -> Result<()> {
+pub async fn run_restart(cmd: RestartCommand) -> Result<()> {
     println!("准备停止 code-navd...");
     run_stop(cmd.stop)?;
     println!("守护进程已停止，准备重新启动...");
-    run_start(cmd.start)
+    run_start(cmd.start).await
 }
 
-fn run_main_loop(
-    _config: &MasterConfig,
-    endpoint: ControlEndpoint,
+async fn run_main_loop(
+    config: &MasterConfig,
     _logging: LoggingGuards,
 ) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -179,23 +182,146 @@ fn run_main_loop(
     })
     .context("failed to install ctrl-c handler")?;
 
-    info!(
-        socket = %endpoint,
-        "code-nav master running; press Ctrl+C to exit"
-    );
+    let cors = CorsLayer::new().allow_origin(Any);
+    let app = Router::new()
+        .route("/rpc", post(rpc_handler))
+        .layer(cors);
 
-    while !shutdown.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_secs(1));
+    let mut listener_tasks = Vec::new();
+
+    for socket_addr_kind in &config.listen {
+        let app = app.clone();
+        match socket_addr_kind {
+            SocketAddrKind::Tcp(addr) => {
+                info!("HTTP server listening on {}", addr);
+                let listener = TcpListener::bind(addr).await?;
+                listener_tasks.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                }));
+            }
+            SocketAddrKind::Unix(path) => {
+                info!("UDS server listening on {}", path.display());
+                let path_clone = path.clone();
+                listener_tasks.push(tokio::spawn(async move {
+                    run_uds_listener(path_clone, app).await.unwrap();
+                }));
+            }
+            SocketAddrKind::NamedPipe(name) => {
+                info!("Named pipe server listening on {}", name);
+                // TODO: Implement named pipe listener
+                listener_tasks.push(tokio::spawn(async move {
+                    // Placeholder for named pipe listener
+                    tokio::signal::ctrl_c().await.unwrap();
+                }));
+            }
+        }
     }
 
-    info!("shutdown requested, exiting master loop");
+    // Wait for all listener tasks to complete or for a shutdown signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutdown requested, exiting master loop");
+        }
+        _ = futures::future::join_all(listener_tasks) => {
+            info!("all listeners stopped, exiting master loop");
+        }
+    }
+
     Ok(())
 }
+
+async fn run_uds_listener(path: PathBuf, _app: Router) -> Result<()> {
+    // Remove the socket file if it already exists
+    if path.exists() {
+        fs::remove_file(&path).context("failed to remove existing UDS file")?;
+    }
+
+    let listener = tokio::net::UnixListener::bind(&path)
+        .with_context(|| format!("failed to bind to UDS path {}", path.display()))?;
+
+    info!("UDS listener started on {}", path.display());
+
+    loop {
+        match listener.accept().await {
+            Ok((_stream, _addr)) => {
+                debug!("Accepted UDS connection");
+                // For now, just accept and close.
+                // TODO: Implement actual RPC handling for UDS
+            }
+            Err(e) => {
+                warn!("UDS accept error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn rpc_handler(Json(request): Json<Request>) -> Json<Response> {
+    tracing::debug!(?request, "received request");
+    let response = handle_rpc_request(request);
+    Json(response)
+}
+
+fn handle_rpc_request(request: Request) -> Response {
+    match request {
+        Request::Info(req) => {
+            if req.target.is_some() {
+                // Mock worker response
+                Response::Info(InfoResponse::Worker(code_nav_protocol::WorkerInfo {
+                    protocol_version: "1.0".to_string(),
+                    server_version: "0.1.0-mock".to_string(),
+                    project_id: "mock_project_id".to_string(),
+                    project_root: "/path/to/mock".into(),
+                    pid: 12345,
+                    uptime_secs: 100,
+                    config_summary: BTreeMap::new(),
+                }))
+            } else {
+                // Mock master response
+                Response::Info(InfoResponse::Master(MasterInfo {
+                    protocol_version: "1.0".to_string(),
+                    server_version: "0.1.0-mock".to_string(),
+                    pid: std::process::id(),
+                    uptime_secs: 60, // a mock uptime
+                    projects_managed: 1,
+                }))
+            }
+        }
+        Request::Status(req) => {
+            if req.target.is_some() {
+                // Mock worker status response
+                // This part is more complex, returning a simple master status for now
+                Response::Status(StatusResponse::Master(MasterStatus {
+                    pid: std::process::id(),
+                    uptime_secs: 60,
+                    workers: vec![],
+                }))
+            } else {
+                // Mock master status response
+                Response::Status(StatusResponse::Master(MasterStatus {
+                    pid: std::process::id(),
+                    uptime_secs: 60,
+                    workers: vec![], // No workers for now
+                }))
+            }
+        }
+        // Add other request handlers here, returning mock data for now
+        _ => Response::Error(code_nav_protocol::ErrorBody {
+            code: code_nav_protocol::ErrorCode::Unsupported,
+            message: "Request type not supported yet".to_string(),
+        }),
+    }
+}
+
 
 fn print_start_feedback(config: &MasterConfig, registry: &ProjectRegistry) {
     println!("code-navd master running");
     println!("  pid: {}", std::process::id());
-    println!("  socket: {}", config.socket);
+    for socket in &config.listen {
+        println!("  socket: {}", socket);
+    }
     println!("  projects registered: {}", registry.project_count());
     println!("  runtime dir: {}", config.runtime_dir.display());
 }
@@ -239,36 +365,6 @@ fn apply_autostart(config: &MasterConfig, registry: &ProjectRegistry) -> Result<
         }
     }
     Ok(())
-}
-
-fn setup_control_endpoint(config: &MasterConfig) -> Result<ControlEndpoint> {
-    match &config.socket {
-        SocketAddrKind::Unix(path) => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "failed to create unix socket directory {}",
-                        parent.display()
-                    )
-                })?;
-            }
-            if path.exists() {
-                fs::remove_file(path).with_context(|| {
-                    format!("failed to remove existing socket {}", path.display())
-                })?;
-            }
-            info!(socket = %config.socket, "prepared unix socket (listener TODO)");
-            Ok(ControlEndpoint::Unix(path.clone()))
-        }
-        SocketAddrKind::NamedPipe(name) => {
-            info!(socket = %config.socket, "prepared named pipe (listener TODO)");
-            Ok(ControlEndpoint::NamedPipe(name.clone()))
-        }
-        SocketAddrKind::Tcp(addr) => {
-            info!(socket = %config.socket, "prepared TCP endpoint (listener TODO)");
-            Ok(ControlEndpoint::Tcp(*addr))
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -333,7 +429,7 @@ struct RegistryEntry {
 #[derive(Debug)]
 struct ProjectRegistry {
     path: PathBuf,
-    entries: HashMap<String, RegistryEntry>,
+    entries: BTreeMap<String, RegistryEntry>,
 }
 
 impl ProjectRegistry {
@@ -354,7 +450,7 @@ impl ProjectRegistry {
         let content = fs::read(&path)?;
         let parsed: RegistryFile =
             serde_json::from_slice(&content).context("invalid registry.json")?;
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         for entry in parsed.projects {
             map.insert(entry.project_root.to_string_lossy().to_string(), entry);
         }
@@ -375,7 +471,7 @@ struct RegistryFile {
 #[derive(Debug, Clone)]
 struct MasterConfig {
     runtime_dir: PathBuf,
-    socket: SocketAddrKind,
+    listen: Vec<SocketAddrKind>,
     foreground: bool,
     grace_period: Duration,
     log_level: Level,
@@ -388,7 +484,7 @@ struct MasterConfig {
 #[derive(Debug)]
 struct StopConfig {
     runtime_dir: PathBuf,
-    socket: SocketAddrKind,
+    listen: Vec<SocketAddrKind>,
     pid_path: PathBuf,
     lock_path: PathBuf,
     grace: Duration,
@@ -427,7 +523,7 @@ impl MasterConfig {
 
         let mut cli_cfg = RawConfig::default();
         cli_cfg.runtime_dir = args.runtime_dir.clone();
-        cli_cfg.socket = args.socket.clone();
+        cli_cfg.listen = args.socket.clone().map(|s| vec![s]);
         if args.foreground {
             cli_cfg.foreground = Some(true);
         }
@@ -476,22 +572,19 @@ impl StopConfig {
         let env_cfg = RawConfig::from_env()?;
         merged = merged.merge(env_cfg);
 
-        if let Some(runtime_dir) = args.runtime_dir.clone() {
-            merged.runtime_dir = Some(runtime_dir);
-        }
         if let Some(socket) = args.socket.clone() {
-            merged.socket = Some(socket);
+            merged.listen = Some(vec![socket]);
         }
 
         let runtime_dir = merged.runtime_dir.unwrap_or(default_runtime_dir()?);
-        let socket = parse_socket(merged.socket.as_deref(), &runtime_dir)?;
+        let listen = parse_listen(merged.listen, &runtime_dir)?;
         let grace = Duration::from_secs(args.grace_secs.clamp(1, 600));
         let timeout_secs = args.timeout_secs.max(args.grace_secs).clamp(1, 1800);
         let timeout = Duration::from_secs(timeout_secs);
 
         Ok(Self {
             runtime_dir: runtime_dir.clone(),
-            socket,
+            listen,
             pid_path: runtime_dir.join("master.pid"),
             lock_path: runtime_dir.join("master.lock"),
             grace,
@@ -509,9 +602,11 @@ fn cleanup_runtime_artifacts(config: &StopConfig) -> Result<()> {
     if config.lock_path.exists() {
         let _ = fs::remove_file(&config.lock_path);
     }
-    if let SocketAddrKind::Unix(path) = &config.socket {
-        if path.exists() {
-            let _ = fs::remove_file(path);
+    for socket_addr_kind in &config.listen {
+        if let SocketAddrKind::Unix(path) = socket_addr_kind {
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
         }
     }
     Ok(())
@@ -520,7 +615,7 @@ fn cleanup_runtime_artifacts(config: &StopConfig) -> Result<()> {
 #[derive(Debug, Clone)]
 struct RawConfig {
     runtime_dir: Option<PathBuf>,
-    socket: Option<String>,
+    listen: Option<Vec<String>>,
     foreground: Option<bool>,
     grace_period_secs: Option<u64>,
     log: Option<RawLogConfig>,
@@ -533,7 +628,7 @@ impl RawConfig {
         let runtime_dir = default_runtime_dir()?;
         Ok(Self {
             runtime_dir: Some(runtime_dir),
-            socket: None,
+            listen: None,
             foreground: None,
             grace_period_secs: None,
             log: Some(RawLogConfig::default()),
@@ -557,7 +652,7 @@ impl RawConfig {
             cfg.runtime_dir = Some(PathBuf::from(runtime));
         }
         if let Ok(socket) = std::env::var("CODE_NAV_MASTER_SOCKET") {
-            cfg.socket = Some(socket);
+            cfg.listen = Some(vec![socket]);
         }
         if let Ok(level) = std::env::var("CODE_NAV_MASTER_LOG_LEVEL") {
             if let Ok(parsed) = LogLevel::from_str_case_insensitive(&level) {
@@ -579,8 +674,8 @@ impl RawConfig {
         if other.runtime_dir.is_some() {
             self.runtime_dir = other.runtime_dir;
         }
-        if other.socket.is_some() {
-            self.socket = other.socket;
+        if other.listen.is_some() {
+            self.listen = other.listen;
         }
         if other.foreground.is_some() {
             self.foreground = other.foreground;
@@ -616,7 +711,7 @@ impl RawConfig {
         fs::create_dir_all(&runtime_dir)
             .with_context(|| format!("failed to create runtime dir {}", runtime_dir.display()))?;
 
-        let socket = parse_socket(self.socket.as_deref(), &runtime_dir)?;
+        let listen = parse_listen(self.listen, &runtime_dir)?;
         let foreground = self.foreground.unwrap_or(false);
         let grace_secs = self.grace_period_secs.unwrap_or(15).clamp(1, 300);
         let log_cfg = self.log.unwrap_or_default();
@@ -630,12 +725,10 @@ impl RawConfig {
 
         let (autostart, list) = self
             .autostart
-            .map(|cfg| {
-                (
+            .map(|cfg| (
                     cfg.mode.unwrap_or(AutostartMode::All),
                     cfg.projects.unwrap_or_default(),
-                )
-            })
+                ))
             .unwrap_or((AutostartMode::All, Vec::new()));
         let autostart_list = list
             .into_iter()
@@ -650,7 +743,7 @@ impl RawConfig {
 
         Ok(MasterConfig {
             runtime_dir,
-            socket,
+            listen,
             foreground,
             grace_period: Duration::from_secs(grace_secs),
             log_level,
@@ -666,7 +759,7 @@ impl Default for RawConfig {
     fn default() -> Self {
         Self {
             runtime_dir: None,
-            socket: None,
+            listen: None,
             foreground: None,
             grace_period_secs: None,
             log: None,
@@ -679,7 +772,7 @@ impl Default for RawConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct FileConfig {
     runtime_dir: Option<PathBuf>,
-    socket: Option<String>,
+    listen: Option<Vec<String>>,
     foreground: Option<bool>,
     grace_period_secs: Option<u64>,
     log: Option<RawLogConfig>,
@@ -690,7 +783,7 @@ impl From<FileConfig> for RawConfig {
     fn from(value: FileConfig) -> Self {
         Self {
             runtime_dir: value.runtime_dir,
-            socket: value.socket,
+            listen: value.listen,
             foreground: value.foreground,
             grace_period_secs: value.grace_period_secs,
             log: value.log,
@@ -755,16 +848,25 @@ fn default_runtime_dir() -> Result<PathBuf> {
     Ok(home.join(".code-nav"))
 }
 
-fn parse_socket(uri: Option<&str>, runtime_dir: &Path) -> Result<SocketAddrKind> {
-    if let Some(value) = uri {
-        parse_socket_value(value)
-    } else if cfg!(windows) {
-        Ok(SocketAddrKind::NamedPipe(String::from(
-            r"\\.\pipe\code-nav-master",
-        )))
+fn parse_listen(uris: Option<Vec<String>>, runtime_dir: &Path) -> Result<Vec<SocketAddrKind>> {
+    let mut sockets = Vec::new();
+    if let Some(uris) = uris {
+        for uri in uris {
+            sockets.push(parse_socket_value(&uri)?);
+        }
     } else {
-        Ok(SocketAddrKind::Unix(runtime_dir.join("master.sock")))
+        // Default behavior if no listen URIs are provided
+        if cfg!(windows) {
+            sockets.push(SocketAddrKind::NamedPipe(String::from(
+                r"\\.\pipe\code-nav-master",
+            )));
+        } else {
+            sockets.push(SocketAddrKind::Unix(runtime_dir.join("master.sock")));
+        }
+        // Add default HTTP listener
+        sockets.push(SocketAddrKind::Tcp("0.0.0.0:6688".parse().unwrap()));
     }
+    Ok(sockets)
 }
 
 fn parse_socket_value(value: &str) -> Result<SocketAddrKind> {
@@ -810,7 +912,7 @@ impl MasterLock {
             return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
         }
 
-        write_pid_file(&pid_path, &config.socket)?;
+        write_pid_file(&pid_path, &config.listen)?;
         Ok(Self { lock, pid_path })
     }
 }
@@ -828,11 +930,12 @@ struct PidInfo {
     socket: Option<String>,
 }
 
-fn write_pid_file(pid_path: &Path, socket: &SocketAddrKind) -> Result<()> {
+fn write_pid_file(pid_path: &Path, sockets: &[SocketAddrKind]) -> Result<()> {
+    let socket_str = sockets.get(0).map_or("unknown".to_string(), |s| s.to_string());
     let info = json!({
         "pid": std::process::id(),
         "started_at": Utc::now().to_rfc3339(),
-        "socket": socket.to_string(),
+        "socket": socket_str,
     });
     let mut file = File::create(pid_path)?;
     file.write_all(info.to_string().as_bytes())?;
@@ -943,22 +1046,7 @@ impl std::fmt::Display for SocketAddrKind {
     }
 }
 
-#[derive(Clone, Debug)]
-enum ControlEndpoint {
-    Unix(PathBuf),
-    NamedPipe(String),
-    Tcp(SocketAddr),
-}
 
-impl std::fmt::Display for ControlEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ControlEndpoint::Unix(path) => write!(f, "uds://{}", path.display()),
-            ControlEndpoint::NamedPipe(name) => write!(f, "npipe://{name}"),
-            ControlEndpoint::Tcp(addr) => write!(f, "tcp://{addr}"),
-        }
-    }
-}
 
 #[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]

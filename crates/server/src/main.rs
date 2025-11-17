@@ -165,7 +165,8 @@ impl RestartArgs {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Start(args) => {
@@ -182,7 +183,7 @@ fn main() -> Result<()> {
                 wait_ready,
                 ready_timeout,
             };
-            master::run_start(start)
+            master::run_start(start).await
         }
         Command::Stop(args) => {
             let stop = master::StopCommand {
@@ -219,7 +220,7 @@ fn main() -> Result<()> {
                 force: args.stop_force,
                 assume_yes: !args.prompt,
             };
-            master::run_restart(master::RestartCommand { start, stop })
+            master::run_restart(master::RestartCommand { start, stop }).await
         }
         Command::Unknown => Ok(()),
     }

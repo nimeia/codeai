@@ -2,11 +2,10 @@ mod client;
 mod commands;
 mod formatter;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use code_nav_protocol::{
-    InfoRequest, InfoResponse, ListKind, MasterInfo, MasterStatus, ProjectRef, Request,
-    StatusRequest, StatusResponse, WorkerInfo, WorkerSummary,
+    InfoRequest, ListKind, ProjectRef, Request, StatusRequest, StatusResponse,
 };
 use commands::{
     logs::{self, LogsArgs},
@@ -17,6 +16,13 @@ use std::path::Path;
 #[derive(Parser)]
 #[command(name = "code-nav", version, about = "code navigation cli")]
 struct Cli {
+    /// Address of the code-nav daemon (e.g., http://localhost:6688, unix:///tmp/code-nav.sock)
+    #[arg(
+        long = "connect",
+        global = true,
+        default_value = "http://localhost:6688"
+    )]
+    connect: String,
     #[command(subcommand)]
     command: Commands,
 }
@@ -67,46 +73,66 @@ enum Kind {
     Files,
 }
 
+pub struct CliContext {
+    client: Box<dyn client::RpcClient>,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
     let cli = Cli::parse();
+
+    let rpc_client = client::new_rpc_client(&cli.connect)?;
+    let ctx = CliContext { client: rpc_client };
+
     match cli.command {
         Commands::Search { query, top_k } => {
-            let request = Request::Search(code_nav_protocol::SearchRequest { query, top_k });
-            // TODO: send request to server; placeholder prints JSON.
-            println!("{}", serde_json::to_string(&request)?);
+            handle_search(&ctx, query, top_k)?;
         }
         Commands::List { kind } => {
-            let list_kind = match kind {
-                Kind::Classes => ListKind::Classes,
-                Kind::Methods => ListKind::Methods,
-                Kind::Files => ListKind::Files,
-            };
-            let request = Request::List(code_nav_protocol::ListRequest {
-                kind: list_kind,
-                filter: None,
-                limit: None,
-            });
-            // TODO: send request to server; placeholder prints JSON.
-            println!("{}", serde_json::to_string(&request)?);
+            handle_list(&ctx, kind)?;
         }
         Commands::Project { action } => {
-            project::run(action)?;
+            project::run(&ctx, action)?;
         }
         Commands::Logs(args) => {
-            logs::run(args)?;
+            logs::run(&ctx, args)?;
         }
         Commands::Info(args) => {
-            handle_info(args)?;
+            handle_info(&ctx, args)?;
         }
         Commands::Status(args) => {
-            handle_status(args)?;
+            handle_status(&ctx, args)?;
         }
     }
     Ok(())
 }
 
-fn handle_info(args: InfoArgs) -> Result<()> {
+fn handle_search(ctx: &CliContext, query: String, top_k: u32) -> Result<()> {
+    let request = Request::Search(code_nav_protocol::SearchRequest { query, top_k });
+    let response = ctx.client.send(&request)?;
+    // TODO: process search response
+    formatter::print_line(&serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn handle_list(ctx: &CliContext, kind: Kind) -> Result<()> {
+    let list_kind = match kind {
+        Kind::Classes => ListKind::Classes,
+        Kind::Methods => ListKind::Methods,
+        Kind::Files => ListKind::Files,
+    };
+    let request = Request::List(code_nav_protocol::ListRequest {
+        kind: list_kind,
+        filter: None,
+        limit: None,
+    });
+    let response = ctx.client.send(&request)?;
+    // TODO: process list response
+    formatter::print_line(&serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn handle_info(ctx: &CliContext, args: InfoArgs) -> Result<()> {
     let target = args.project.map(|p| {
         if Path::new(&p).exists() {
             ProjectRef::Path(p)
@@ -116,138 +142,35 @@ fn handle_info(args: InfoArgs) -> Result<()> {
     });
 
     let request = Request::Info(InfoRequest { target });
-    let payload = serde_json::to_string(&request)?;
+    let response = ctx.client.send(&request)?;
 
-    if let Some(response_payload) = client::send_request(&payload)? {
-        let response: code_nav_protocol::Response = serde_json::from_str(&response_payload)
-            .context("failed to deserialize response from server")?;
-
-        if let code_nav_protocol::Response::Info(info_response) = response {
-            if args.json {
-                formatter::print_line(&serde_json::to_string_pretty(&info_response)?);
-            } else {
-                print_info_response(info_response);
-            }
+    if let code_nav_protocol::Response::Info(info_response) = response {
+        if args.json {
+            formatter::print_line(&serde_json::to_string_pretty(&info_response)?);
         } else {
-            formatter::print_line("Error: received unexpected response type from server");
+            formatter::print_info_response(info_response);
         }
+    } else {
+        formatter::print_line("Error: received unexpected response type from server");
     }
     Ok(())
 }
 
-fn handle_status(args: StatusArgs) -> Result<()> {
+fn handle_status(ctx: &CliContext, args: StatusArgs) -> Result<()> {
     let request = Request::Status(StatusRequest { target: None });
-    let payload = serde_json::to_string(&request)?;
+    let response = ctx.client.send(&request)?;
 
-    if let Some(response_payload) = client::send_request(&payload)? {
-        let response: code_nav_protocol::Response = serde_json::from_str(&response_payload)
-            .context("failed to deserialize response from server")?;
-
-        if let code_nav_protocol::Response::Status(StatusResponse::Master(master_status)) = response
-        {
-            if args.json {
-                formatter::print_line(&serde_json::to_string_pretty(&master_status)?);
-            } else {
-                print_master_status(master_status);
-            }
+    if let code_nav_protocol::Response::Status(StatusResponse::Master(master_status)) = response {
+        if args.json {
+            formatter::print_line(&serde_json::to_string_pretty(&master_status)?);
         } else {
-            formatter::print_line("Error: received unexpected response type from server");
+            formatter::print_master_status(master_status);
         }
+    } else {
+        formatter::print_line("Error: received unexpected response type from server");
     }
     Ok(())
 }
-
-fn print_info_response(response: InfoResponse) {
-    match response {
-        InfoResponse::Master(info) => print_master_info(info),
-        InfoResponse::Worker(info) => print_worker_info(info),
-    }
-}
-
-fn print_master_info(info: MasterInfo) {
-    formatter::print_line("CodeNav Master");
-    formatter::print_line(&format!("{:<16} {}", "Version:", info.server_version));
-    formatter::print_line(&format!("{:<16} {}", "Protocol:", info.protocol_version));
-    formatter::print_line(&format!("{:<16} {}", "PID:", info.pid));
-    formatter::print_line(&format!(
-        "{:<16} {}",
-        "Uptime:",
-        formatter::format_uptime(info.uptime_secs)
-    ));
-    formatter::print_line(&format!("{:<16} {}", "Projects:", info.projects_managed));
-}
-
-fn print_worker_info(info: WorkerInfo) {
-    formatter::print_line("CodeNav Worker");
-    formatter::print_line(&format!("{:<16} {}", "Project ID:", info.project_id));
-    formatter::print_line(&format!(
-        "{:<16} {}",
-        "Project Root:",
-        info.project_root.display()
-    ));
-    formatter::print_line(&format!("{:<16} {}", "Version:", info.server_version));
-    formatter::print_line(&format!("{:<16} {}", "PID:", info.pid));
-    formatter::print_line(&format!(
-        "{:<16} {}",
-        "Uptime:",
-        formatter::format_uptime(info.uptime_secs)
-    ));
-    if !info.config_summary.is_empty() {
-        formatter::print_line(&format!("{:<16}", "Config:"));
-        for (k, v) in info.config_summary {
-            formatter::print_line(&format!("  - {:<14} {}", format!("{}:", k), v));
-        }
-    }
-}
-
-fn print_master_status(status: MasterStatus) {
-    let mut rows = Vec::new();
-    rows.push(vec![
-        "ID".to_string(),
-        "PATH".to_string(),
-        "STATUS".to_string(),
-        "INDEXED".to_string(),
-        "UPTIME".to_string(),
-    ]);
-
-    for worker in status.workers {
-        rows.push(vec![
-            worker.project_id,
-            worker.project_root.display().to_string(),
-            serde_json::to_string(&worker.status).unwrap_or_default(),
-            format!("{} files", worker.indexed_files_count),
-            formatter::format_uptime(worker.uptime_secs),
-        ]);
-    }
-
-    let mut widths = vec![0; rows[0].len()];
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
-        }
-    }
-
-    for (i, row) in rows.iter().enumerate() {
-        let formatted = row
-            .iter()
-            .enumerate()
-            .map(|(j, cell)| format!("{:<width$}", cell, width = widths[j]))
-            .collect::<Vec<_>>()
-            .join("  ");
-        formatter::print_line(&formatted);
-        if i == 0 {
-            let separator = widths
-                .iter()
-                .map(|w| "-".repeat(*w))
-                .collect::<Vec<_>>()
-                .join("  ");
-            formatter::print_line(&separator);
-        }
-    }
-}
-
-
-
 
 #[cfg(test)]
 mod tests {

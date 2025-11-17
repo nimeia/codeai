@@ -25,3 +25,7 @@ is-terminal.workspace = true
 windows-sys.workspace = true
 libc.workspace = true
 cfg-if.workspace = true
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+futures = "0.3"

@@ -9,12 +9,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::NonEmptyStringValueParser, Args, Subcommand, ValueEnum};
 use code_nav_protocol::{
     IndexMode, ProjectAddRequest, ProjectListRequest, ProjectRef, ProjectRemoveRequest,
-    ProjectRestartRequest, Request, StatusRequest, StatusResponse, WorkerStatus,
+    ProjectRestartRequest, Request, StatusRequest, StatusResponse,
 };
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 
-use crate::{client, formatter};
+use crate::formatter;
+use crate::CliContext;
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
@@ -30,13 +31,13 @@ pub enum ProjectCommand {
     Restart(ProjectRestartArgs),
 }
 
-pub fn run(cmd: ProjectCommand) -> Result<()> {
+pub fn run(ctx: &CliContext, cmd: ProjectCommand) -> Result<()> {
     match cmd {
-        ProjectCommand::Add(args) => handle_add(args),
-        ProjectCommand::Remove(args) => handle_remove(args),
-        ProjectCommand::List(args) => handle_list(args),
-        ProjectCommand::Status(args) => handle_status(args),
-        ProjectCommand::Restart(args) => handle_restart(args),
+        ProjectCommand::Add(args) => handle_add(ctx, args),
+        ProjectCommand::Remove(args) => handle_remove(ctx, args),
+        ProjectCommand::List(args) => handle_list(ctx, args),
+        ProjectCommand::Status(args) => handle_status(ctx, args),
+        ProjectCommand::Restart(args) => handle_restart(ctx, args),
     }
 }
 
@@ -223,7 +224,7 @@ fn to_protocol_project_runtime_filter(
 
 const REGISTRY_VERSION: u32 = 1;
 
-fn handle_add(args: ProjectAddArgs) -> Result<()> {
+fn handle_add(ctx: &CliContext, args: ProjectAddArgs) -> Result<()> {
     let project_root = normalize_project_path(&args.project)?;
     let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
 
@@ -249,8 +250,7 @@ fn handle_add(args: ProjectAddArgs) -> Result<()> {
         index_mode: to_protocol_index_mode(args.index_mode),
         model: args.model.clone(),
     });
-    let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload)?;
+    let _response = ctx.client.send(&request)?; // Send request through new RpcClient
 
     let entry = ProjectEntry {
         project_id: project_id.clone(),
@@ -280,15 +280,14 @@ fn handle_add(args: ProjectAddArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_remove(args: ProjectRemoveArgs) -> Result<()> {
+fn handle_remove(ctx: &CliContext, args: ProjectRemoveArgs) -> Result<()> {
     let request = Request::ProjectRemove(ProjectRemoveRequest {
         project: to_protocol_project_ref(&args.project),
         force: args.force,
         keep_data: args.keep_data,
         grace_sec: args.grace,
     });
-    let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload)?;
+    let _response = ctx.client.send(&request)?; // Send request through new RpcClient
 
     let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let removed = registry
@@ -310,12 +309,11 @@ fn handle_remove(args: ProjectRemoveArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_list(args: ProjectListArgs) -> Result<()> {
+fn handle_list(ctx: &CliContext, args: ProjectListArgs) -> Result<()> {
     let request = Request::ProjectList(ProjectListRequest {
         status: args.status.map(to_protocol_project_runtime_filter),
     });
-    let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload)?;
+    let _response = ctx.client.send(&request)?; // Send request through new RpcClient
     formatter::print_line("List request sent to master daemon. Showing local cache.");
 
     let registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
@@ -340,7 +338,8 @@ fn handle_list(args: ProjectListArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_status(args: ProjectStatusArgs) -> Result<()> {
+
+fn handle_status(ctx: &CliContext, args: ProjectStatusArgs) -> Result<()> {
     if args.watch.is_some() {
         formatter::print_line("TODO: implement --watch to stream project status");
         return Ok(());
@@ -350,68 +349,73 @@ fn handle_status(args: ProjectStatusArgs) -> Result<()> {
     let request = Request::Status(StatusRequest {
         target: Some(project_ref),
     });
-    let payload = serde_json::to_string(&request)?;
+    let response = ctx.client.send(&request)?; // Send request through new RpcClient
 
-    if let Some(response_payload) = client::send_request(&payload)? {
-        let response: code_nav_protocol::Response = serde_json::from_str(&response_payload)
-            .context("failed to deserialize response from server")?;
-
-        if let code_nav_protocol::Response::Status(StatusResponse::Worker(worker_status)) = response
-        {
-            if args.json {
-                formatter::print_line(&serde_json::to_string_pretty(&worker_status)?);
-            } else {
-                print_worker_status(worker_status);
-            }
+    if let code_nav_protocol::Response::Status(StatusResponse::Worker(worker_status)) = response
+    {
+        if args.json {
+            formatter::print_line(&serde_json::to_string_pretty(&worker_status)?);
         } else {
-            formatter::print_line("Error: received unexpected response type from server");
+            formatter::print_worker_status(worker_status); // Use formatter function
         }
+    } else {
+        formatter::print_line("Error: received unexpected response type from server");
     }
 
     Ok(())
 }
 
-fn print_worker_status(status: WorkerStatus) {
-    let summary = status.summary;
-    formatter::print_line(&format!(
-        "Project: {} ({})",
-        summary.project_id,
-        summary.project_root.display()
-    ));
+fn print_project_table(entries: &[ProjectSnapshot], verbose: bool) {
+    let mut rows = Vec::with_capacity(entries.len() + 1);
+    let mut header = vec![
+        "ID".to_string(),
+        "Path".to_string(),
+        "State".to_string(),
+        "Autostart".to_string(),
+        "Watch".to_string(),
+    ];
+    if verbose {
+        header.push("Index Mode".to_string());
+        header.push("Model".to_string());
+    }
+    rows.push(header);
 
-    let status_string = match status.indexer_state.state {
-        code_nav_protocol::WorkerState::Indexing => {
-            if let Some(percent) = status.indexer_state.progress_percent {
-                format!("Indexing ({:.1}%)", percent)
-            } else {
-                "Indexing".to_string()
-            }
+    for entry in entries {
+        let mut row = vec![
+            entry.project_id.clone(),
+            entry.project_root.display().to_string(),
+            entry.state.clone(),
+            entry.autostart.to_string(),
+            entry.watch.to_string(),
+        ];
+        if verbose {
+            row.push(format!("{:?}", entry.index_mode));
+            row.push(entry.model.clone().unwrap_or_else(|| "-".into()));
         }
-        _ => serde_json::to_string(&summary.status).unwrap_or_default(),
-    };
-    formatter::print_line(&format!("{:<12} {}", "Status:", status_string));
+        rows.push(row);
+    }
 
-    if let Some(file) = status.indexer_state.current_file {
-        if !file.is_empty() {
-            formatter::print_line(&format!("{:<12} {}", "File:", file));
+    let column_count = rows[0].len();
+    let mut widths = vec![0usize; column_count];
+    for row in &rows {
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(cell.len());
         }
     }
 
-    formatter::print_line(&format!(
-        "{:<12} {}",
-        "Uptime:",
-        formatter::format_uptime(summary.uptime_secs)
-    ));
-
-    let watcher_status = if status.is_watching { "Active" } else { "Inactive" };
-    formatter::print_line(&format!("{:<12} {}", "Watcher:", watcher_status));
-    formatter::print_line(&format!(
-        "{:<12} {} tasks pending",
-        "Queue:", status.task_queue_size
-    ));
+    for row in rows {
+        let formatted = row
+            .iter()
+            .enumerate()
+            .map(|(idx, cell)| format!("{:<width$}", cell, width = widths[idx]))
+            .collect::<Vec<_>>()
+            .join("  ");
+        formatter::print_line(&formatted);
+    }
 }
 
-fn handle_restart(args: ProjectRestartArgs) -> Result<()> {
+
+fn handle_restart(ctx: &CliContext, args: ProjectRestartArgs) -> Result<()> {
     let request = Request::ProjectRestart(ProjectRestartRequest {
         projects: args
             .project
@@ -424,8 +428,7 @@ fn handle_restart(args: ProjectRestartArgs) -> Result<()> {
         timeout_sec: args.timeout,
         reason: args.reason.clone(),
     });
-    let payload = serde_json::to_string(&request)?;
-    client::send_request(&payload)?;
+    let _response = ctx.client.send(&request)?; // Send request through new RpcClient
 
     let mut registry = ProjectRegistry::load(args.runtime_dir.as_deref())?;
     let mut updated = Vec::new();
@@ -563,13 +566,6 @@ impl ProjectRegistry {
             .any(|entry| entry.project_id == id)
     }
 
-    fn find(&self, reference: &str) -> Option<&ProjectEntry> {
-        self.file
-            .projects
-            .iter()
-            .find(|entry| entry.matches(reference))
-    }
-
     fn find_mut(&mut self, reference: &str) -> Option<&mut ProjectEntry> {
         self.file
             .projects
@@ -679,86 +675,9 @@ struct RestartOutput {
     projects: Vec<ProjectSnapshot>,
 }
 
-fn print_project_table(entries: &[ProjectSnapshot], verbose: bool) {
-    let mut rows = Vec::with_capacity(entries.len() + 1);
-    let mut header = vec![
-        "ID".to_string(),
-        "Path".to_string(),
-        "State".to_string(),
-        "Autostart".to_string(),
-        "Watch".to_string(),
-    ];
-    if verbose {
-        header.push("Index Mode".to_string());
-        header.push("Model".to_string());
-    }
-    rows.push(header);
 
-    for entry in entries {
-        let mut row = vec![
-            entry.project_id.clone(),
-            entry.project_root.display().to_string(),
-            entry.state.clone(),
-            entry.autostart.to_string(),
-            entry.watch.to_string(),
-        ];
-        if verbose {
-            row.push(format!("{:?}", entry.index_mode));
-            row.push(entry.model.clone().unwrap_or_else(|| "-".into()));
-        }
-        rows.push(row);
-    }
 
-    let column_count = rows[0].len();
-    let mut widths = vec![0usize; column_count];
-    for row in &rows {
-        for (idx, cell) in row.iter().enumerate() {
-            widths[idx] = widths[idx].max(cell.len());
-        }
-    }
 
-    for row in rows {
-        let formatted = row
-            .iter()
-            .enumerate()
-            .map(|(idx, cell)| format!("{:<width$}", cell, width = widths[idx]))
-            .collect::<Vec<_>>()
-            .join("  ");
-        formatter::print_line(&formatted);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum StatusField {
-    Meta,
-    State,
-    Policy,
-}
-
-fn parse_status_fields(input: Option<&str>) -> Vec<StatusField> {
-    if let Some(raw) = input {
-        let mut fields = Vec::new();
-        for token in raw
-            .split(',')
-            .map(|token| token.trim())
-            .filter(|token| !token.is_empty())
-        {
-            match token {
-                "meta" | "project" | "id" => fields.push(StatusField::Meta),
-                "state" => fields.push(StatusField::State),
-                "policy" | "settings" => fields.push(StatusField::Policy),
-                other => formatter::print_line(&format!("Ignoring unknown status field '{other}'")),
-            }
-        }
-        if fields.is_empty() {
-            vec![StatusField::Meta, StatusField::State, StatusField::Policy]
-        } else {
-            fields
-        }
-    } else {
-        vec![StatusField::Meta, StatusField::State, StatusField::Policy]
-    }
-}
 
 impl ProjectRuntimeFilter {
     fn matches_state(&self, state: &str) -> bool {
