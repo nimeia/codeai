@@ -181,8 +181,7 @@ mod tests {
     fn cli_exposes_project_subcommand() {
         let cmd = Cli::command();
         assert!(
-            cmd.get_subcommands()
-                .any(|sub| sub.get_name() == "project"),
+            cmd.get_subcommands().any(|sub| sub.get_name() == "project"),
             "`project` 子命令应该在顶级 CLI 中出现"
         );
     }

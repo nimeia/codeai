@@ -5,7 +5,6 @@ use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use code_nav_protocol::{LogLevel, LogOutputFormat, LogTarget, LogsRequest, ProjectRef, Request};
 
-
 use crate::formatter;
 use crate::CliContext; // Add CliContext
 

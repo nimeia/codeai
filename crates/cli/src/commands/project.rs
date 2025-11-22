@@ -338,7 +338,6 @@ fn handle_list(ctx: &CliContext, args: ProjectListArgs) -> Result<()> {
     Ok(())
 }
 
-
 fn handle_status(ctx: &CliContext, args: ProjectStatusArgs) -> Result<()> {
     if args.watch.is_some() {
         formatter::print_line("TODO: implement --watch to stream project status");
@@ -351,8 +350,7 @@ fn handle_status(ctx: &CliContext, args: ProjectStatusArgs) -> Result<()> {
     });
     let response = ctx.client.send(&request)?; // Send request through new RpcClient
 
-    if let code_nav_protocol::Response::Status(StatusResponse::Worker(worker_status)) = response
-    {
+    if let code_nav_protocol::Response::Status(StatusResponse::Worker(worker_status)) = response {
         if args.json {
             formatter::print_line(&serde_json::to_string_pretty(&worker_status)?);
         } else {
@@ -414,7 +412,6 @@ fn print_project_table(entries: &[ProjectSnapshot], verbose: bool) {
     }
 }
 
-
 fn handle_restart(ctx: &CliContext, args: ProjectRestartArgs) -> Result<()> {
     let request = Request::ProjectRestart(ProjectRestartRequest {
         projects: args
@@ -458,7 +455,6 @@ fn handle_restart(ctx: &CliContext, args: ProjectRestartArgs) -> Result<()> {
     }
     Ok(())
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegistryFile {
@@ -674,10 +670,6 @@ struct ProjectListOutput {
 struct RestartOutput {
     projects: Vec<ProjectSnapshot>,
 }
-
-
-
-
 
 impl ProjectRuntimeFilter {
     fn matches_state(&self, state: &str) -> bool {
