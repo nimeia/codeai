@@ -3,13 +3,14 @@ use std::{
     fmt, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::NonEmptyStringValueParser, Args, Subcommand, ValueEnum};
 use code_nav_protocol::{
     IndexMode, ProjectAddRequest, ProjectListRequest, ProjectRef, ProjectRemoveRequest,
-    ProjectRestartRequest, Request, StatusRequest, StatusResponse,
+    ProjectRestartRequest, Request, StatusRequest, StatusResponse, WorkerStatus,
 };
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
@@ -339,28 +340,15 @@ fn handle_list(ctx: &CliContext, args: ProjectListArgs) -> Result<()> {
 }
 
 fn handle_status(ctx: &CliContext, args: ProjectStatusArgs) -> Result<()> {
-    if args.watch.is_some() {
-        formatter::print_line("TODO: implement --watch to stream project status");
+    let project_ref = to_protocol_project_ref(&args.project);
+
+    if let Some(interval) = args.watch {
+        watch_worker_status(ctx, project_ref, interval, args.json)?;
         return Ok(());
     }
 
-    let project_ref = to_protocol_project_ref(&args.project);
-    let request = Request::Status(StatusRequest {
-        target: Some(project_ref),
-    });
-    let response = ctx.client.send(&request)?; // Send request through new RpcClient
-
-    if let code_nav_protocol::Response::Status(StatusResponse::Worker(worker_status)) = response {
-        if args.json {
-            formatter::print_line(&serde_json::to_string_pretty(&worker_status)?);
-        } else {
-            formatter::print_worker_status(worker_status); // Use formatter function
-        }
-    } else {
-        formatter::print_line("Error: received unexpected response type from server");
-    }
-
-    Ok(())
+    let worker_status = fetch_worker_status(ctx, project_ref)?;
+    render_worker_status(worker_status, args.json)
 }
 
 fn print_project_table(entries: &[ProjectSnapshot], verbose: bool) {
@@ -409,6 +397,51 @@ fn print_project_table(entries: &[ProjectSnapshot], verbose: bool) {
             .collect::<Vec<_>>()
             .join("  ");
         formatter::print_line(&formatted);
+    }
+}
+
+fn fetch_worker_status(ctx: &CliContext, project_ref: ProjectRef) -> Result<WorkerStatus> {
+    let request = Request::Status(StatusRequest {
+        target: Some(project_ref),
+    });
+    let response = ctx.client.send(&request)?; // Send request through new RpcClient
+
+    if let code_nav_protocol::Response::Status(StatusResponse::Worker(worker_status)) = response {
+        Ok(worker_status)
+    } else {
+        bail!("Error: received unexpected response type from server");
+    }
+}
+
+fn render_worker_status(status: WorkerStatus, json: bool) -> Result<()> {
+    if json {
+        formatter::print_line(&serde_json::to_string_pretty(&status)?);
+    } else {
+        formatter::print_worker_status(status);
+    }
+    Ok(())
+}
+
+fn watch_worker_status(
+    ctx: &CliContext,
+    project_ref: ProjectRef,
+    interval_secs: u64,
+    json: bool,
+) -> Result<()> {
+    let interval_secs = interval_secs.max(1);
+    let sleep_duration = Duration::from_secs(interval_secs);
+
+    if !json {
+        formatter::print_line(&format!(
+            "Watching project status every {}s (press Ctrl+C to stop)...",
+            interval_secs
+        ));
+    }
+
+    loop {
+        let worker_status = fetch_worker_status(ctx, project_ref.clone())?;
+        render_worker_status(worker_status, json)?;
+        std::thread::sleep(sleep_duration);
     }
 }
 

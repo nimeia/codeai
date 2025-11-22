@@ -39,3 +39,20 @@ Commands:
 ```
 
 后续可在各 crate 中逐步替换占位实现，接入 tree-sitter、embedding 后端、HNSW 向量库等真实逻辑。
+
+## `status` 命令输出指标速览
+
+当前的 `code-nav status` 会先展示 Master 进程自身的指标，然后按项目输出 Worker 概览表：
+
+```
+CodeNav Master Status
+PID:        12345
+Uptime:     1h 3m 12s
+Workers:    2
+ID          PID    PATH                   STATUS      INDEXED     UPTIME
+proj-a      20001  /path/to/proj-a        "running"   120 files   52m 1s
+proj-b      20002  /path/to/proj-b        "indexing"  42 files    12m 8s
+```
+
+- **Master**：输出 PID、运行时长以及当前管理的 Worker 数量。
+- **Worker 表格**：针对每个项目列出 `ID`、`PID`、`PATH`、`STATUS`、已索引文件数以及运行时间，便于快速核对状态。

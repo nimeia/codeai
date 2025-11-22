@@ -72,9 +72,22 @@ pub fn print_worker_info(info: WorkerInfo) {
 }
 
 pub fn print_master_status(status: MasterStatus) {
+    print_line("CodeNav Master Status");
+    print_line(&format!("{:<12} {}", "PID:", status.pid));
+    print_line(&format!(
+        "{:<12} {}",
+        "Uptime:",
+        format_uptime(status.uptime_secs)
+    ));
+    print_line(&format!("{:<12} {}", "Workers:", status.workers.len()));
+    if status.workers.is_empty() {
+        return;
+    }
+
     let mut rows = Vec::new();
     rows.push(vec![
         "ID".to_string(),
+        "PID".to_string(),
         "PATH".to_string(),
         "STATUS".to_string(),
         "INDEXED".to_string(),
@@ -84,6 +97,7 @@ pub fn print_master_status(status: MasterStatus) {
     for worker in status.workers {
         rows.push(vec![
             worker.project_id,
+            worker.pid.to_string(),
             worker.project_root.display().to_string(),
             serde_json::to_string(&worker.status).unwrap_or_default(),
             format!("{} files", worker.indexed_files_count),
