@@ -42,6 +42,12 @@ struct StartArgs {
     /// 设置日志级别
     #[arg(long, value_enum)]
     log_level: Option<master::LogLevel>,
+    /// 自定义 master 日志目录（用于避开默认运行目录膨胀）
+    #[arg(long)]
+    log_dir: Option<std::path::PathBuf>,
+    /// worker 日志暂存目录，控制上报前的缓冲位置
+    #[arg(long)]
+    worker_log_spool: Option<std::path::PathBuf>,
     /// 前台运行（默认配置可覆盖）
     #[arg(long)]
     foreground: bool,
@@ -101,6 +107,12 @@ struct RestartArgs {
     /// start 时的日志级别
     #[arg(long, value_enum)]
     log_level: Option<master::LogLevel>,
+    /// 重启时自定义 master 日志目录
+    #[arg(long)]
+    log_dir: Option<std::path::PathBuf>,
+    /// 重启时 worker 日志暂存目录
+    #[arg(long)]
+    worker_log_spool: Option<std::path::PathBuf>,
     /// start 是否前台运行
     #[arg(long)]
     foreground: bool,
@@ -177,6 +189,8 @@ async fn main() -> Result<()> {
                 runtime_dir: args.runtime_dir,
                 socket: args.socket,
                 log_level: args.log_level,
+                log_dir: args.log_dir,
+                worker_log_spool: args.worker_log_spool,
                 foreground: args.foreground,
                 grace: args.grace,
                 autostart: args.autostart,
@@ -205,6 +219,8 @@ async fn main() -> Result<()> {
                 runtime_dir: args.runtime_dir.clone(),
                 socket: args.socket.clone(),
                 log_level: args.log_level,
+                log_dir: args.log_dir,
+                worker_log_spool: args.worker_log_spool,
                 foreground: args.foreground,
                 grace: args.start_grace,
                 autostart: args.autostart,

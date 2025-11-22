@@ -19,7 +19,7 @@ use cfg_if::cfg_if;
 use chrono::Utc;
 use clap::ValueEnum;
 use code_nav_protocol::{
-    InfoResponse, MasterInfo, Request, Response, StatusResponse, MasterStatus,
+    InfoResponse, MasterInfo, MasterStatus, Request, Response, StatusResponse,
 };
 use fslock::LockFile;
 use is_terminal::IsTerminal;
@@ -30,6 +30,9 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn, Level};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::time::UtcTime;
+
+mod logs;
 
 #[derive(Debug)]
 pub struct StartCommand {
@@ -37,6 +40,8 @@ pub struct StartCommand {
     pub runtime_dir: Option<PathBuf>,
     pub socket: Option<String>,
     pub log_level: Option<LogLevel>,
+    pub log_dir: Option<PathBuf>,
+    pub worker_log_spool: Option<PathBuf>,
     pub foreground: bool,
     pub grace: Option<u64>,
     pub autostart: AutostartMode,
@@ -94,17 +99,18 @@ pub fn run_stop(args: StopCommand) -> Result<()> {
             "code-navd 未在运行（未找到运行目录 {:?}）",
             config.runtime_dir
         );
-        return Ok(())
+        return Ok(());
     }
 
     let pid_info = match read_pid_file(&config.pid_path) {
         Ok(info) => info,
         Err(err)
-            if err.downcast_ref::<io::Error>().map(|e| e.kind()) == Some(io::ErrorKind::NotFound) =>
+            if err.downcast_ref::<io::Error>().map(|e| e.kind())
+                == Some(io::ErrorKind::NotFound) =>
         {
             println!("code-navd 未在运行（未找到 PID 文件）");
             cleanup_runtime_artifacts(&config)?;
-            return Ok(())
+            return Ok(());
         }
         Err(err) => {
             return Err(err).context("无法读取 master.pid");
@@ -116,19 +122,19 @@ pub fn run_stop(args: StopCommand) -> Result<()> {
         None => {
             println!("PID 文件缺少进程信息，视为未运行");
             cleanup_runtime_artifacts(&config)?;
-            return Ok(())
+            return Ok(());
         }
     };
 
     if !config.assume_yes && !confirm_stop()? {
         println!("已取消停止操作");
-        return Ok(())
+        return Ok(());
     }
 
     if !is_process_alive(pid) {
         println!("code-navd 不在运行（PID {pid} 不存在），清理残留文件");
         cleanup_runtime_artifacts(&config)?;
-        return Ok(())
+        return Ok(());
     }
 
     println!("发送停止请求（PID {pid}）...");
@@ -141,7 +147,7 @@ pub fn run_stop(args: StopCommand) -> Result<()> {
         if !is_process_alive(pid) {
             println!("停止成功，PID {pid} 已退出");
             cleanup_runtime_artifacts(&config)?;
-            return Ok(())
+            return Ok(());
         }
 
         if config.force && !forced && start.elapsed() >= config.grace {
@@ -171,10 +177,7 @@ pub async fn run_restart(cmd: RestartCommand) -> Result<()> {
     run_start(cmd.start).await
 }
 
-async fn run_main_loop(
-    config: &MasterConfig,
-    _logging: LoggingGuards,
-) -> Result<()> {
+async fn run_main_loop(config: &MasterConfig, _logging: LoggingGuards) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_flag = shutdown.clone();
     ctrlc::set_handler(move || {
@@ -183,9 +186,7 @@ async fn run_main_loop(
     .context("failed to install ctrl-c handler")?;
 
     let cors = CorsLayer::new().allow_origin(Any);
-    let app = Router::new()
-        .route("/rpc", post(rpc_handler))
-        .layer(cors);
+    let app = Router::new().route("/rpc", post(rpc_handler)).layer(cors);
 
     let mut listener_tasks = Vec::new();
 
@@ -307,6 +308,13 @@ fn handle_rpc_request(request: Request) -> Response {
                 }))
             }
         }
+        Request::Logs(req) => match logs::global() {
+            Some(service) => service.handle_request(req),
+            None => Response::Error(code_nav_protocol::ErrorBody {
+                code: code_nav_protocol::ErrorCode::InternalError,
+                message: "日志服务尚未初始化".to_string(),
+            }),
+        },
         // Add other request handlers here, returning mock data for now
         _ => Response::Error(code_nav_protocol::ErrorBody {
             code: code_nav_protocol::ErrorCode::Unsupported,
@@ -314,7 +322,6 @@ fn handle_rpc_request(request: Request) -> Response {
         }),
     }
 }
-
 
 fn print_start_feedback(config: &MasterConfig, registry: &ProjectRegistry) {
     println!("code-navd master running");
@@ -376,13 +383,16 @@ impl LoggingGuards {
     fn init(config: &MasterConfig) -> Result<Self> {
         use tracing_subscriber::{fmt, prelude::*, registry};
 
+        let logs_service = logs::init_global(config.log_history_limit);
+        let capture_layer = logs::CaptureLayer::new(logs_service, "master");
         let console_layer = fmt::layer()
             .with_target(true)
             .with_ansi(config.foreground)
+            .with_timer(UtcTime::rfc_3339())
             .with_writer(|| std::io::stdout())
             .with_filter(LevelFilter::from_level(config.log_level));
 
-        let base = registry().with(console_layer);
+        let base = registry().with(capture_layer).with(console_layer);
 
         if let Some(file_path) = &config.log_file {
             if let Some(parent) = file_path.parent() {
@@ -398,15 +408,15 @@ impl LoggingGuards {
                 .into_owned();
             let file = tracing_appender::rolling::never(directory, file_name);
             let (non_blocking, worker_guard) = tracing_appender::non_blocking(file);
-            base.with(
-                fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_target(true)
-                    .with_ansi(false)
-                    .with_filter(LevelFilter::from_level(config.log_level)),
-            )
-            .try_init()
-            .map_err(|err| anyhow!("failed to initialize logging: {err}"))?;
+            let file_layer = fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_timer(UtcTime::rfc_3339())
+                .with_target(true)
+                .with_filter(LevelFilter::from_level(config.log_level));
+            base.with(file_layer)
+                .try_init()
+                .map_err(|err| anyhow!("failed to initialize logging: {err}"))?;
             return Ok(Self {
                 _file_guard: Some(worker_guard),
             });
@@ -474,8 +484,11 @@ struct MasterConfig {
     listen: Vec<SocketAddrKind>,
     foreground: bool,
     grace_period: Duration,
+    log_dir: PathBuf,
+    worker_log_spool: PathBuf,
     log_level: Level,
     log_file: Option<PathBuf>,
+    log_history_limit: usize,
     autostart: AutostartMode,
     autostart_list: Vec<PathBuf>,
     config_path: Option<PathBuf>,
@@ -531,8 +544,20 @@ impl MasterConfig {
         if let Some(level) = args.log_level {
             cli_cfg.log = Some(RawLogConfig {
                 level: Some(level),
+                dir: args.log_dir.clone(),
+                worker_spool_dir: args.worker_log_spool.clone(),
                 file: None,
             });
+        }
+        if args.log_dir.is_some() || args.worker_log_spool.is_some() {
+            let mut log_cfg = cli_cfg.log.take().unwrap_or_default();
+            if args.log_dir.is_some() {
+                log_cfg.dir = args.log_dir.clone();
+            }
+            if args.worker_log_spool.is_some() {
+                log_cfg.worker_spool_dir = args.worker_log_spool.clone();
+            }
+            cli_cfg.log = Some(log_cfg);
         }
         cli_cfg.autostart = Some(RawAutostartConfig {
             mode: Some(args.autostart),
@@ -658,9 +683,21 @@ impl RawConfig {
             if let Ok(parsed) = LogLevel::from_str_case_insensitive(&level) {
                 cfg.log = Some(RawLogConfig {
                     level: Some(parsed),
+                    dir: None,
+                    worker_spool_dir: None,
                     file: None,
                 });
             }
+        }
+        if let Ok(dir) = std::env::var("CODE_NAV_MASTER_LOG_DIR") {
+            let mut log_cfg = cfg.log.take().unwrap_or_default();
+            log_cfg.dir = Some(PathBuf::from(dir));
+            cfg.log = Some(log_cfg);
+        }
+        if let Ok(spool_dir) = std::env::var("CODE_NAV_MASTER_WORKER_LOG_SPOOL") {
+            let mut log_cfg = cfg.log.take().unwrap_or_default();
+            log_cfg.worker_spool_dir = Some(PathBuf::from(spool_dir));
+            cfg.log = Some(log_cfg);
         }
         if let Ok(grace) = std::env::var("CODE_NAV_MASTER_GRACE") {
             if let Ok(value) = grace.parse() {
@@ -716,19 +753,52 @@ impl RawConfig {
         let grace_secs = self.grace_period_secs.unwrap_or(15).clamp(1, 300);
         let log_cfg = self.log.unwrap_or_default();
         let log_level = log_cfg.level.map(Level::from).unwrap_or(Level::INFO);
+        let log_dir = log_cfg.dir.unwrap_or_else(|| runtime_dir.join("logs"));
+        let log_dir = if log_dir.is_relative() {
+            runtime_dir.join(log_dir)
+        } else {
+            log_dir
+        };
+        fs::create_dir_all(&log_dir)
+            .with_context(|| format!("failed to create log dir {}", log_dir.display()))?;
+
+        let worker_log_spool = log_cfg
+            .worker_spool_dir
+            .unwrap_or_else(|| runtime_dir.join("worker-log-spool"));
+        let worker_log_spool = if worker_log_spool.is_relative() {
+            runtime_dir.join(worker_log_spool)
+        } else {
+            worker_log_spool
+        };
+        fs::create_dir_all(&worker_log_spool).with_context(|| {
+            format!(
+                "failed to create worker log spool dir {}",
+                worker_log_spool.display()
+            )
+        })?;
+
         let log_file = log_cfg.file.map(|mut path| {
             if path.is_relative() {
                 path = runtime_dir.join(path);
             }
             path
         });
+        let log_file = match (log_file, foreground) {
+            (Some(path), _) => Some(path),
+            (None, false) => Some(log_dir.join("master.log")),
+            (None, true) => None,
+        };
+
+        let log_history_limit = logs::history_capacity_or_default(log_cfg.history_limit);
 
         let (autostart, list) = self
             .autostart
-            .map(|cfg| (
+            .map(|cfg| {
+                (
                     cfg.mode.unwrap_or(AutostartMode::All),
                     cfg.projects.unwrap_or_default(),
-                ))
+                )
+            })
             .unwrap_or((AutostartMode::All, Vec::new()));
         let autostart_list = list
             .into_iter()
@@ -746,8 +816,11 @@ impl RawConfig {
             listen,
             foreground,
             grace_period: Duration::from_secs(grace_secs),
+            log_dir,
+            worker_log_spool,
             log_level,
             log_file,
+            log_history_limit,
             autostart,
             autostart_list,
             config_path: self.config_path,
@@ -796,7 +869,10 @@ impl From<FileConfig> for RawConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawLogConfig {
     level: Option<LogLevel>,
+    dir: Option<PathBuf>,
+    worker_spool_dir: Option<PathBuf>,
     file: Option<PathBuf>,
+    history_limit: Option<usize>,
 }
 
 impl RawLogConfig {
@@ -804,8 +880,17 @@ impl RawLogConfig {
         if other.level.is_some() {
             self.level = other.level;
         }
+        if other.dir.is_some() {
+            self.dir = other.dir;
+        }
+        if other.worker_spool_dir.is_some() {
+            self.worker_spool_dir = other.worker_spool_dir;
+        }
         if other.file.is_some() {
             self.file = other.file;
+        }
+        if other.history_limit.is_some() {
+            self.history_limit = other.history_limit;
         }
         self
     }
@@ -931,7 +1016,9 @@ struct PidInfo {
 }
 
 fn write_pid_file(pid_path: &Path, sockets: &[SocketAddrKind]) -> Result<()> {
-    let socket_str = sockets.get(0).map_or("unknown".to_string(), |s| s.to_string());
+    let socket_str = sockets
+        .get(0)
+        .map_or("unknown".to_string(), |s| s.to_string());
     let info = json!({
         "pid": std::process::id(),
         "started_at": Utc::now().to_rfc3339(),
@@ -1045,8 +1132,6 @@ impl std::fmt::Display for SocketAddrKind {
         }
     }
 }
-
-
 
 #[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]

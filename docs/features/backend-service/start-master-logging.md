@@ -14,6 +14,7 @@
 2. 若 log 文件路径在 `runtime_dir/logs` 下，确保目录存在并具备写权限。
 3. 初始化 tracing subscriber（例如 `tracing_subscriber::fmt` + rolling appender）。
 4. 若配置启用 JSON 输出，则使用 `tracing_subscriber::fmt().json()`。
+5. 在 subscriber pipeline 中插入 `CaptureLayer`（见 `master/logs.rs`），将 master 事件采样为 `LogEvent` 并写入内存 ring buffer，默认容量 10k，可在配置中调整。
 
 ## 3. 文件轮转策略
 - 推荐复用 `tracing-appender`：
@@ -25,7 +26,7 @@
 ## 4. STDOUT/后台模式切换
 - `foreground=true`：默认输出到 STDOUT/stderr，方便调试。
 - `foreground=false`：默认写文件；如未配置 `file`，自动创建 `runtime_dir/logs/master.log`。
-- 支持 `--log-file -` 强制 STDOUT。
+- 支持 `--log-file -` 强制 STDOUT；无论输出目标如何，捕获层都会记录一份结构化事件到内存缓冲，供 `LogsService` 回放。
 
 ## 5. 日志上下文
 - 在 subscriber 中设置全局字段（`master_id`, `socket`, `pid`）。

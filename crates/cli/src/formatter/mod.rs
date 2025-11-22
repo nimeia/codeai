@@ -149,7 +149,11 @@ pub fn print_worker_status(status: WorkerStatus) {
         format_uptime(summary.uptime_secs)
     ));
 
-    let watcher_status = if status.is_watching { "Active" } else { "Inactive" };
+    let watcher_status = if status.is_watching {
+        "Active"
+    } else {
+        "Inactive"
+    };
     print_line(&format!("{:<12} {}", "Watcher:", watcher_status));
     print_line(&format!(
         "{:<12} {} tasks pending",

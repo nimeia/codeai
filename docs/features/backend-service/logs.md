@@ -18,36 +18,32 @@
      [--level <trace|debug|info|warn|error>] \
      [--json] [--color auto|always|never]
    ```
-2. 默认 `--target master`；当目标为 `worker` 时必须提供 `--project <path|id>`，CLI 负责解析并在请求中带上 `ProjectRef`。
+2. 默认 `--target master`；当目标为 `worker` 时必须提供 `--project <path|id>`，CLI 负责解析并在请求中带上 `ProjectRef`。当前 master 端仅实现 **master** 历史回放，收到 `LogTarget::Worker` 将返回 `Unsupported` 错误。
 3. `--limit` 控制历史回放数量（默认 500，最大 10k）；`--level` 用于 server 端过滤日志级别。
 4. 输出模式：文本时按 `[YYYY-MM-DD HH:MM:SS][LEVEL][source] message` 格式；`--json` 时逐行输出 `LogEvent` JSON。
 
 ## 3. 时间/输出控制规则
-- `--since` 可输入相对时长（`10m`、`2h`、`1d`）或 RFC3339（`2024-04-18T10:00:00Z`）。CLI 将其转换为 Unix 时间戳传入 `LogsRequest`。
+- `--since` 可输入相对时长（`10m`、`2h`、`1d`）或 RFC3339（`2024-04-18T10:00:00Z`）。CLI 将其转换为 Unix 时间戳（秒）传入 `LogsRequest`。
 - 若同时指定 `--since` 与 `--limit`，server 先按时间过滤，再截断到 limit。
-- `--follow/-f`：CLI 先打印历史记录，再保持长连接；`--follow-interval` 决定 CLI 刷新频率（默认 250ms）。
+- `--follow/-f`：当前 master 端尚未提供流式 follow；CLI 请求 follow 会收到 `Unsupported` 错误，后续实现时遵循“先历史后实时”的规则。
 - 文本模式颜色遵循 `--color`：`auto`（仅 TTY）、`always`、`never`。不同 level 上色规则需在 CLI formatter 中统一实现。
 
 ## 4. Master 端日志聚合服务
 1. **LogsService 组件**
-   - 驻留于 `crates/server/src/master/logs.rs`（建议新文件），负责管理历史缓冲、文件回溯与 worker 流。
-   - 历史缓冲：基于 `VecDeque<LogEvent>` 的 ring buffer，容量默认 10k，可在配置中调优；溢出时淘汰最旧事件。
-   - 持久落盘：可选写入 `runtime_dir/logs/master.log`，当 `--since` 早于内存缓冲时，从文件尾部回溯补齐。
-2. **Worker 日志流管理**
-   - Supervisor 捕获 worker 的 stdout/stderr 或 `tracing` sink，通过 IPC 将 `LogEvent` 转发给 master。
-   - LogsService 为每个 `project_id` 维护一个 `broadcast::Sender<LogEvent>`；`worker` 目标订阅该 sender，支持多客户端并发。
+   - 驻留于 `crates/server/src/master/logs.rs`，通过 `VecDeque<LogEvent>` ring buffer 管理近期历史。容量默认 10k，可在配置中调优；溢出时淘汰最旧事件。
+   - 持久落盘：master 常规日志输出仍由 tracing subscriber 负责；LogsService 专注于内存回放，不再直接读取文件补齐历史，后续可以在此基础上扩展文件回溯。
+2. **tracing 捕获层**
+   - 使用 `CaptureLayer` 作为 tracing layer，覆盖 master 当前 subscriber，将事件转换为 `LogEvent` 并写入 `LogsService`。
+   - 捕获层会刷新 `ts` 字段为当前 Unix 时间戳秒值，沿用原始 `target`、`message` 与结构化字段。
 3. **RPC 接口**
-   - `LogsHistory(LogsRequest) -> LogsResponse { events: Vec<LogEvent> }`：一次性回放。
-   - `LogsStream(LogsRequest) -> stream<LogEvent>`：若 `follow=true` 则保持连接；若 `follow=false`，stream 在发送完历史记录后立即关闭。
-   - Server 负责处理 `limit/since/level/project` 等过滤，确保不会回传多余数据。
+   - `LogsHistory(LogsRequest) -> LogsResponse { events: Vec<LogEvent> }`：一次性回放 master 历史。
+   - `LogsStream(LogsRequest)` 暂未开放；收到 follow 请求会返回 `Unsupported` 错误，避免误导客户端。
+   - Server 端在收集时处理 `limit/since/level` 过滤，确保不会回传多余数据。
 
 ## 5. Worker 侧日志上报
-1. Worker 使用统一的 `tracing` subscriber，将事件输出到：
-   - 本地文件/STDOUT（供调试）。
-   - Supervisor 通道（`WorkerLogEvent`），由 master 聚合。
-2. `WorkerLogEvent` 序列化为 `LogEvent`，字段中 `source="worker:<project_id>"`，`target` 记录具体组件（`watcher`, `indexer` 等）。
-3. 当 worker 停止时，supervisor 需向 master 发送 `LogEvent`（level=`INFO`，message=`worker stopped`）并关闭对应的 `broadcast`。
-4. 若 worker 离线而 CLI 请求 `--follow`，LogsService 应立即返回 `WorkerOffline` 错误或提供仅限历史缓冲的数据，并提示用户 worker 已停止。
+1. 设计目标保持不变：统一使用 `tracing` subscriber 输出到本地和 supervisor 通道；`WorkerLogEvent` 序列化为 `LogEvent`，`source="worker:<project_id>"`，`target` 记录组件名。
+2. 当前阶段 master 端尚未接入 worker 流，也不会持有 worker 专用缓冲。收到 `LogTarget::Worker` 请求将直接返回 `Unsupported`，避免误报 worker 状态。
+3. 后续接入时需补齐：worker 停止事件广播、按项目维度的 `broadcast` 订阅、以及离线错误码处理。
 
 ## 6. 协议与数据结构
 - 在 `crates/protocol/src/logs.rs` 定义：
@@ -67,7 +63,7 @@
   }
 
   pub struct LogEvent {
-      pub ts: Timestamp,
+      pub ts: i64,                        // Unix 时间戳（秒）
       pub level: LogLevel,
       pub source: String,                 // master | worker:<id>
       pub target: Option<String>,         // 组件名，如 watcher/indexer
@@ -88,7 +84,15 @@
   - `PermissionDenied`：为未来多用户/ACL 预留。
 - CLI 文本模式遇到错误时输出 `Error (<code>): <message>`；JSON 模式输出 `{ "error": { "code": "ProjectNotFound", "message": "..." } }`。
 
-## 8. 验收清单
+## 8. 存储格式
+- 落盘/暂存/传输统一采用 NDJSON 的 `LogEvent` 结构，详见 @/docs/features/backend-service/log-storage-format.md。
+- master 写文件时使用秒级 Unix 时间戳且不带 ANSI；worker spool 使用相同格式以便断点续传与批量推送。
+
+## 9. 当前阶段实现状态
+- master 侧：`LogsService` 已接入 tracing 捕获层，支持 master 历史回放、级别与时间过滤、缓冲容量配置；follow 流与文件补齐尚未实现。
+- worker 侧：请求会收到 `Unsupported`，待后续接入 worker 日志上报与 spool 传输后再开放。
+
+## 10. 验收清单
 1. **CLI**：参数解析、`--help`、颜色控制、文本 vs JSON 输出、follow 模式中断/退出码单测。
 2. **Protocol**：`LogsRequest/LogEvent` 序列化测试，确保 `LogLevel` 与 `ProjectRef` 兼容已有协议。
 3. **Master LogsService**：
