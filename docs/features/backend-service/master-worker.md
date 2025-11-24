@@ -40,6 +40,13 @@
 - master 停止：发出 `Shutdown` 给所有 worker，等待退出后再退出自身。
 - worker 启停：由 master 管控；worker 自身的 `start` 流程沿用之前设计（配置解析、单实例锁、资源加载等）。
 
+### 6.1 `project add` 触发的 worker 启动链路
+- **入口编排**：CLI 解析 `project add` 参数后序列化为 `ProjectAddRequest`，master 仅负责注册 + 调度，立即返回 `ProjectAddResponse` 携带 `AddState` 与初始 `QueuedWorkerState`。
+- **注册与排队**：master 使用 `RegistryWriter` 规范化路径并写入 `registry.json`，随后将项目写入 pending 队列（如 `runtime_dir/projects/pending/<project_id>.json`），状态置为 `Pending`/`Starting`。
+- **Supervisor 限流启动**：Supervisor 监听 pending 队列并遵守 `max_concurrent_starts`，为每个项目分配 socket/runtime/配置后 spawn worker。
+- **Worker 自举与上报**：worker `bootstrap(project_root)` 创建或升级 `.code-nav/`、初始化 `metadata.db` 与向量索引、启动索引器+watcher+RPC，依次上报 `WorkerEvent::{Started, Ready, Failed, Stopped}`；master 将事件映射为 `ProjectRuntimeState`，供 `project add/status/list` 共用。
+- **启动前防重复/脏数据检查**：在 supervisor 真正 spawn 前检测 registry 状态、现有 PID/socket、`.code-nav/lock`、核心索引文件可读写性，以及上次失败标记，避免重复拉起或带着损坏数据启动。
+
 该架构在 Linux/macOS/Windows 上均可实现，关键在于抽象跨平台 IPC 与子进程管理；master 增加统一入口避免端口爆炸，同时提供项目级隔离与调度能力。
 
 ## 7. code-navd 命令行
