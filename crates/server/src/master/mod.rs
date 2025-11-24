@@ -193,6 +193,7 @@ async fn run_main_loop(config: &MasterConfig, _logging: LoggingGuards) -> Result
 
     let cors = CorsLayer::new().allow_origin(Any);
     let app = Router::new()
+        .route("/", post(rpc_handler))
         .route("/rpc", post(rpc_handler))
         .route("/info", post(info_handler))
         .route("/status", post(status_handler))
