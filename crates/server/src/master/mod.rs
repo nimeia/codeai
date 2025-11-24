@@ -16,17 +16,17 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{extract::State, routing::post, Json, Router};
-use cfg_if::cfg_if;
 use chrono::Utc;
 use clap::ValueEnum;
+use code_nav_core::indexer::{self, IndexJob, IndexProgress, IndexReport, IndexRunMode};
 use code_nav_protocol::{
     ErrorBody, ErrorCode, GotoRequest, GotoResponse, IndexMode, IndexRequest, IndexResponse,
-    InfoRequest, InfoResponse, ListItem, ListKind, ListRequest, ListResponse, LogsRequest,
-    MasterInfo, MasterStatus, ProjectAddRequest, ProjectAddResponse, ProjectInfo,
+    IndexerState, InfoRequest, InfoResponse, ListItem, ListKind, ListRequest, ListResponse,
+    LogsRequest, MasterInfo, MasterStatus, ProjectAddRequest, ProjectAddResponse, ProjectInfo,
     ProjectListRequest, ProjectListResponse, ProjectRef, ProjectRemoveRequest,
     ProjectRemoveResponse, ProjectRestartRequest, ProjectRestartResponse, ProjectStatusRequest,
     ProjectStatusResponse, Request, Response, SearchRequest, SearchResponse, StatusRequest,
-    StatusResponse,
+    StatusResponse, WorkerInfo, WorkerState, WorkerStatus, WorkerSummary,
 };
 use fslock::LockFile;
 use is_terminal::IsTerminal;
@@ -76,6 +76,10 @@ pub struct RestartCommand {
 #[derive(Clone)]
 struct MasterState {
     registry: Arc<Mutex<ProjectRegistry>>,
+    runtime: Arc<Mutex<BTreeMap<String, ProjectRuntimeEntry>>>,
+    workers: Arc<Mutex<BTreeMap<String, WorkerRuntimeEntry>>>,
+    runtime_dir: PathBuf,
+    worker_log_spool: PathBuf,
 }
 
 pub async fn run_start(args: StartCommand) -> Result<()> {
@@ -84,6 +88,8 @@ pub async fn run_start(args: StartCommand) -> Result<()> {
     let logging = LoggingGuards::init(&config)?;
 
     let registry = Arc::new(Mutex::new(ProjectRegistry::load(&config)?));
+    let runtime = Arc::new(Mutex::new(BTreeMap::<String, ProjectRuntimeEntry>::new()));
+    let workers = Arc::new(Mutex::new(BTreeMap::<String, WorkerRuntimeEntry>::new()));
 
     if args.wait_ready {
         debug!(
@@ -106,7 +112,7 @@ pub async fn run_start(args: StartCommand) -> Result<()> {
         print_start_feedback(&config, &registry_guard);
     }
 
-    run_main_loop(&config, logging, registry).await
+    run_main_loop(&config, logging, registry, runtime, workers).await
 }
 
 pub fn run_stop(args: StopCommand) -> Result<()> {
@@ -199,8 +205,16 @@ async fn run_main_loop(
     config: &MasterConfig,
     _logging: LoggingGuards,
     registry: Arc<Mutex<ProjectRegistry>>,
+    runtime: Arc<Mutex<BTreeMap<String, ProjectRuntimeEntry>>>,
+    workers: Arc<Mutex<BTreeMap<String, WorkerRuntimeEntry>>>,
 ) -> Result<()> {
-    let state = MasterState { registry };
+    let state = MasterState {
+        registry,
+        runtime,
+        workers,
+        runtime_dir: config.runtime_dir.clone(),
+        worker_log_spool: config.worker_log_spool.clone(),
+    };
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_flag = shutdown.clone();
     ctrlc::set_handler(move || {
@@ -465,29 +479,43 @@ async fn project_restart_handler(
 
 fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
     match request {
-        Request::Info(req) => {
-            if req.target.is_some() {
-                // Mock worker response
-                Response::Info(InfoResponse::Worker(code_nav_protocol::WorkerInfo {
+        Request::Info(req) => match req
+            .target
+            .as_ref()
+            .and_then(|project| state.resolve_project(project))
+        {
+            Some(project) => match state.worker_status(&project.project_id) {
+                Some(worker) => Response::Info(InfoResponse::Worker(WorkerInfo {
                     protocol_version: "1.0".to_string(),
-                    server_version: "0.1.0-mock".to_string(),
-                    project_id: "mock_project_id".to_string(),
-                    project_root: "/path/to/mock".into(),
-                    pid: 12345,
-                    uptime_secs: 100,
+                    server_version: "0.1.0".to_string(),
+                    project_id: worker.summary.project_id.clone(),
+                    project_root: worker.summary.project_root.clone(),
+                    pid: worker.summary.pid,
+                    uptime_secs: worker.summary.uptime_secs,
                     config_summary: BTreeMap::new(),
-                }))
-            } else {
-                // Mock master response
-                Response::Info(InfoResponse::Master(MasterInfo {
+                })),
+                None => Response::Error(ErrorBody {
+                    code: ErrorCode::NotIndexed,
+                    message: format!(
+                        "project {} is registered but no worker is active",
+                        project.project_id
+                    ),
+                }),
+            },
+            None => match state.master_status() {
+                Ok(status) => Response::Info(InfoResponse::Master(MasterInfo {
                     protocol_version: "1.0".to_string(),
-                    server_version: "0.1.0-mock".to_string(),
-                    pid: std::process::id(),
-                    uptime_secs: 60, // a mock uptime
-                    projects_managed: 1,
-                }))
-            }
-        }
+                    server_version: "0.1.0".to_string(),
+                    pid: status.pid,
+                    uptime_secs: status.uptime_secs,
+                    projects_managed: status.workers.len(),
+                })),
+                Err(err) => Response::Error(ErrorBody {
+                    code: ErrorCode::InternalError,
+                    message: err.to_string(),
+                }),
+            },
+        },
         Request::Search(_req) => Response::Search(SearchResponse { hits: vec![] }),
         Request::Goto(_req) => Response::Goto(GotoResponse {
             file: None,
@@ -520,24 +548,29 @@ fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
             }),
         },
         Request::Index(_req) => Response::Index(IndexResponse { started: true }),
-        Request::Status(req) => {
-            if req.target.is_some() {
-                // Mock worker status response
-                // This part is more complex, returning a simple master status for now
-                Response::Status(StatusResponse::Master(MasterStatus {
-                    pid: std::process::id(),
-                    uptime_secs: 60,
-                    workers: vec![],
-                }))
-            } else {
-                // Mock master status response
-                Response::Status(StatusResponse::Master(MasterStatus {
-                    pid: std::process::id(),
-                    uptime_secs: 60,
-                    workers: vec![], // No workers for now
-                }))
-            }
-        }
+        Request::Status(req) => match req
+            .target
+            .as_ref()
+            .and_then(|project| state.resolve_project(project))
+        {
+            Some(project) => match state.worker_status(&project.project_id) {
+                Some(worker) => Response::Status(StatusResponse::Worker(worker)),
+                None => Response::Error(ErrorBody {
+                    code: ErrorCode::NotIndexed,
+                    message: format!(
+                        "project {} is registered but worker has not started",
+                        project.project_id
+                    ),
+                }),
+            },
+            None => match state.master_status() {
+                Ok(status) => Response::Status(StatusResponse::Master(status)),
+                Err(err) => Response::Error(ErrorBody {
+                    code: ErrorCode::InternalError,
+                    message: err.to_string(),
+                }),
+            },
+        },
         Request::Logs(req) => match logs::global() {
             Some(service) => service.handle_request(req),
             None => Response::Error(ErrorBody {
@@ -562,52 +595,49 @@ fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
                 ProjectRef::Id(id) => PathBuf::from(id),
             },
         }),
-        Request::ProjectList(_req) => {
-            Response::ProjectList(ProjectListResponse { projects: vec![] })
-        }
-        Request::ProjectStatus(req) => Response::ProjectStatus(ProjectStatusResponse {
-            info: ProjectInfo {
-                project_id: match &req.project {
-                    ProjectRef::Path(path) => format!("proj-{path}"),
-                    ProjectRef::Id(id) => id.clone(),
-                },
-                project_root: match &req.project {
-                    ProjectRef::Path(path) => PathBuf::from(path),
-                    ProjectRef::Id(id) => PathBuf::from(id),
-                },
-                autostart: false,
-                watch: false,
-                index_mode: IndexMode::Auto,
-                model: None,
-                state: "running".to_string(),
-            },
-        }),
-        Request::ProjectRestart(req) => Response::ProjectRestart(ProjectRestartResponse {
-            projects: req
-                .projects
-                .into_iter()
-                .map(|project| ProjectInfo {
-                    project_id: match &project {
-                        ProjectRef::Path(path) => format!("proj-{path}"),
-                        ProjectRef::Id(id) => id.clone(),
-                    },
-                    project_root: match &project {
-                        ProjectRef::Path(path) => PathBuf::from(path),
-                        ProjectRef::Id(id) => PathBuf::from(id),
-                    },
-                    autostart: false,
-                    watch: false,
-                    index_mode: IndexMode::Auto,
-                    model: None,
-                    state: "restarting".to_string(),
-                })
-                .collect(),
-        }),
+        Request::ProjectList(_req) => match state.list_projects() {
+            Ok(projects) => Response::ProjectList(ProjectListResponse { projects }),
+            Err(err) => Response::Error(ErrorBody {
+                code: ErrorCode::InternalError,
+                message: err.to_string(),
+            }),
+        },
+        Request::ProjectStatus(req) => match state.project_status(&req.project) {
+            Ok(info) => Response::ProjectStatus(ProjectStatusResponse { info }),
+            Err(err) => Response::Error(ErrorBody {
+                code: ErrorCode::InvalidRequest,
+                message: err.to_string(),
+            }),
+        },
+        Request::ProjectRestart(req) => match state.restart_projects(req.projects) {
+            Ok(projects) => Response::ProjectRestart(ProjectRestartResponse { projects }),
+            Err(err) => Response::Error(ErrorBody {
+                code: ErrorCode::InvalidRequest,
+                message: err.to_string(),
+            }),
+        },
     }
 }
 
 impl MasterState {
     fn register_project(&self, req: ProjectAddRequest) -> Result<ProjectAddResponse> {
+        let (entry, duplicate) = self.register_in_registry(&req)?;
+        let info = self.ensure_runtime_entry(&entry, Some(&req))?;
+        let state_label = if duplicate { "duplicate" } else { "starting" }.to_string();
+        self.update_project_state(&entry.project_id, &state_label, None)?;
+
+        if !duplicate {
+            self.spawn_worker(entry.clone(), req)?;
+        }
+
+        Ok(ProjectAddResponse {
+            project_id: entry.project_id,
+            project_root: info.project_root,
+            state: state_label,
+        })
+    }
+
+    fn register_in_registry(&self, req: &ProjectAddRequest) -> Result<(RegistryEntry, bool)> {
         let canonical = fs::canonicalize(&req.project_root).with_context(|| {
             format!("project path {} does not exist", req.project_root.display())
         })?;
@@ -622,17 +652,41 @@ impl MasterState {
             .lock()
             .map_err(|_| anyhow!("failed to acquire registry lock"))?;
 
-        if let Some(entry) = registry.contains_root(&canonical) {
-            info!(
-                project_root = %canonical.display(),
-                project_id = %entry.project_id,
-                "project already registered"
-            );
-            return Ok(ProjectAddResponse {
-                project_id: entry.project_id.clone(),
-                project_root: entry.project_root.clone(),
-                state: "duplicate".to_string(),
-            });
+        if let Some(existing) = registry.contains_root_mut(&canonical) {
+            let mut updated = false;
+            if existing.autostart != req.autostart {
+                existing.autostart = req.autostart;
+                updated = true;
+            }
+            if existing.watch != req.watch {
+                existing.watch = req.watch;
+                updated = true;
+            }
+            if existing.index_mode != req.index_mode {
+                existing.index_mode = req.index_mode.clone();
+                updated = true;
+            }
+            if existing.model != req.model {
+                existing.model = req.model.clone();
+                updated = true;
+            }
+
+            if updated {
+                registry.persist()?;
+                info!(
+                    project_root = %canonical.display(),
+                    project_id = %existing.project_id,
+                    "project already registered; options updated",
+                );
+            } else {
+                info!(
+                    project_root = %canonical.display(),
+                    project_id = %existing.project_id,
+                    "project already registered",
+                );
+            }
+
+            return Ok((existing.clone(), true));
         }
 
         let project_id = if let Some(custom) = req.id.clone() {
@@ -650,23 +704,547 @@ impl MasterState {
         let entry = RegistryEntry {
             project_id: project_id.clone(),
             project_root: canonical.clone(),
+            autostart: req.autostart,
+            watch: req.watch,
+            index_mode: req.index_mode.clone(),
+            model: req.model.clone(),
             last_running: false,
             last_state: Some("pending".to_string()),
         };
 
-        registry.add(entry)?;
+        registry.add(entry.clone())?;
 
         info!(
             project_id = %project_id,
             project_root = %canonical.display(),
-            "project registered and pending worker startup"
+            "project registered and pending worker startup",
         );
 
-        Ok(ProjectAddResponse {
-            project_id,
-            project_root: canonical,
-            state: "registered".to_string(),
+        Ok((entry, false))
+    }
+
+    fn ensure_runtime_entry(
+        &self,
+        entry: &RegistryEntry,
+        source: Option<&ProjectAddRequest>,
+    ) -> Result<ProjectInfo> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire runtime state lock"))?;
+
+        if let Some(existing) = runtime.get(&entry.project_id) {
+            return Ok(existing.info.clone());
+        }
+
+        let info = ProjectInfo {
+            project_id: entry.project_id.clone(),
+            project_root: entry.project_root.clone(),
+            autostart: source.map(|s| s.autostart).unwrap_or(entry.autostart),
+            watch: source.map(|s| s.watch).unwrap_or(entry.watch),
+            index_mode: source
+                .map(|s| s.index_mode.clone())
+                .unwrap_or(entry.index_mode.clone()),
+            model: source
+                .and_then(|s| s.model.clone())
+                .or_else(|| entry.model.clone()),
+            state: entry
+                .last_state
+                .clone()
+                .unwrap_or_else(|| "pending".to_string()),
+        };
+
+        runtime.insert(
+            entry.project_id.clone(),
+            ProjectRuntimeEntry {
+                info: info.clone(),
+                last_error: None,
+            },
+        );
+
+        Ok(info)
+    }
+
+    fn update_project_state(
+        &self,
+        project_id: &str,
+        state: &str,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        let registry_entry = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire registry lock"))?;
+            registry.by_id(project_id).cloned()
+        };
+
+        {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire runtime state lock"))?;
+            let project_root = registry_entry
+                .as_ref()
+                .map(|entry| entry.project_root.clone())
+                .unwrap_or_default();
+            let entry =
+                runtime
+                    .entry(project_id.to_string())
+                    .or_insert_with(|| ProjectRuntimeEntry {
+                        info: ProjectInfo {
+                            project_id: project_id.to_string(),
+                            project_root,
+                            autostart: false,
+                            watch: false,
+                            index_mode: IndexMode::Auto,
+                            model: None,
+                            state: state.to_string(),
+                        },
+                        last_error: None,
+                    });
+            entry.info.state = state.to_string();
+            entry.last_error = last_error.clone();
+        }
+
+        if let Some(_entry) = registry_entry {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire registry lock"))?;
+            if let Some(reg) = registry.by_id_mut(project_id) {
+                reg.last_state = Some(state.to_string());
+            }
+            registry.persist()?;
+        }
+
+        Ok(())
+    }
+
+    fn spawn_worker(&self, entry: RegistryEntry, req: ProjectAddRequest) -> Result<()> {
+        {
+            let mut workers = self
+                .workers
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire worker state lock"))?;
+            if let Some(existing) = workers.get(&entry.project_id) {
+                info!(
+                    project_id = %entry.project_id,
+                    state = ?existing.summary.status,
+                    "worker already active, skip spawn",
+                );
+                return Ok(());
+            }
+
+            let summary = WorkerSummary {
+                project_id: entry.project_id.clone(),
+                project_root: entry.project_root.clone(),
+                pid: std::process::id(),
+                status: WorkerState::Starting,
+                indexed_files_count: 0,
+                uptime_secs: 0,
+            };
+
+            workers.insert(
+                entry.project_id.clone(),
+                WorkerRuntimeEntry {
+                    summary,
+                    started_at: Instant::now(),
+                    last_error: None,
+                    indexer_state: IndexerState {
+                        state: WorkerState::Starting,
+                        progress_percent: Some(0.0),
+                        current_file: None,
+                    },
+                },
+            );
+        }
+
+        self.update_project_state(&entry.project_id, "starting", None)?;
+        self.persist_worker_state(&entry.project_id)?;
+
+        let state = self.clone();
+        let entry_for_bootstrap = entry.clone();
+        tokio::spawn(async move {
+            state.run_worker_bootstrap(entry_for_bootstrap).await;
+        });
+
+        debug!(
+            project_id = %req.id.clone().unwrap_or_else(|| entry.project_id.clone()),
+            watch = req.watch,
+            autostart = req.autostart,
+            index_mode = ?req.index_mode,
+            "worker spawn scheduled",
+        );
+
+        Ok(())
+    }
+
+    async fn run_worker_bootstrap(&self, entry: RegistryEntry) {
+        info!(
+            project_id = %entry.project_id,
+            project_root = %entry.project_root.display(),
+            "starting worker"
+        );
+
+        if let Err(err) = self.prepare_worker_runtime(&entry) {
+            warn!(
+                project_id = %entry.project_id,
+                error = %err,
+                "failed to prepare worker runtime"
+            );
+            let _ = self.set_worker_state(
+                &entry.project_id,
+                WorkerState::Failed,
+                Some(err.to_string()),
+            );
+            return;
+        }
+
+        if let Err(err) = self.set_worker_state(&entry.project_id, WorkerState::Indexing, None) {
+            warn!(
+                project_id = %entry.project_id,
+                error = %err,
+                "failed to mark worker as indexing",
+            );
+            return;
+        }
+
+        let project_id = entry.project_id.clone();
+        let project_root = entry.project_root.clone();
+        let state_for_progress = self.clone();
+        let index_result = tokio::task::spawn_blocking(move || {
+            let job = IndexJob::new(project_root).with_mode(IndexRunMode::Full);
+            indexer::run_with_progress(job, |progress| {
+                if let Err(err) = state_for_progress.update_index_progress(&project_id, progress) {
+                    warn!(project_id = %project_id, error = %err, "failed to update index progress");
+                }
+            })
         })
+        .await;
+
+        match index_result {
+            Ok(Ok(report)) => {
+                if let Err(err) = self.apply_index_report(&entry.project_id, &report) {
+                    warn!(
+                        project_id = %entry.project_id,
+                        error = %err,
+                        "failed to persist index report",
+                    );
+                }
+                if let Err(err) =
+                    self.set_worker_state(&entry.project_id, WorkerState::Running, None)
+                {
+                    warn!(
+                        project_id = %entry.project_id,
+                        error = %err,
+                        "failed to mark worker as running",
+                    );
+                    return;
+                }
+                if let Ok(mut registry) = self.registry.lock() {
+                    if let Err(err) = registry.mark_running(&entry.project_id, true) {
+                        warn!(
+                            project_id = %entry.project_id,
+                            error = %err,
+                            "failed to persist running state"
+                        );
+                    }
+                }
+
+                info!(
+                    project_id = %entry.project_id,
+                    files_total = report.files_total,
+                    symbols = report.symbols_indexed,
+                    "worker is now running",
+                );
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    project_id = %entry.project_id,
+                    error = %err,
+                    "indexer failed",
+                );
+                let _ = self.set_worker_state(
+                    &entry.project_id,
+                    WorkerState::Failed,
+                    Some(err.to_string()),
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    project_id = %entry.project_id,
+                    error = %join_err,
+                    "indexer task join failed",
+                );
+                let _ = self.set_worker_state(
+                    &entry.project_id,
+                    WorkerState::Failed,
+                    Some(join_err.to_string()),
+                );
+            }
+        }
+    }
+
+    fn prepare_worker_runtime(&self, entry: &RegistryEntry) -> Result<()> {
+        let project_dir = self.runtime_dir.join("projects").join(&entry.project_id);
+        fs::create_dir_all(&project_dir)
+            .with_context(|| format!("failed to create runtime dir {}", project_dir.display()))?;
+
+        let worker_log = self
+            .worker_log_spool
+            .join(format!("{}.log", entry.project_id));
+        if !worker_log.exists() {
+            File::create(&worker_log).with_context(|| {
+                format!(
+                    "failed to initialize worker log spool {}",
+                    worker_log.display()
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn set_worker_state(
+        &self,
+        project_id: &str,
+        state: WorkerState,
+        last_error: Option<String>,
+    ) -> Result<WorkerSummary> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire worker state lock"))?;
+        let runtime = workers
+            .get_mut(project_id)
+            .ok_or_else(|| anyhow!("worker {project_id} not found"))?;
+        runtime.summary.status = state.clone();
+        runtime.last_error = last_error.clone();
+        runtime.indexer_state.state = state.clone();
+        if state != WorkerState::Indexing {
+            runtime.indexer_state.progress_percent = None;
+            runtime.indexer_state.current_file = None;
+        }
+        let snapshot = runtime.snapshot();
+        drop(workers);
+
+        self.update_project_state(project_id, worker_state_label(&state), last_error)?;
+        self.persist_worker_state(project_id)?;
+
+        if state == WorkerState::Running {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire registry lock"))?;
+            registry.mark_running(project_id, true)?;
+        }
+
+        Ok(snapshot)
+    }
+
+    fn update_index_progress(&self, project_id: &str, progress: IndexProgress) -> Result<()> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire worker state lock"))?;
+        let runtime = workers
+            .get_mut(project_id)
+            .ok_or_else(|| anyhow!("worker {project_id} not found"))?;
+        runtime.indexer_state.state = WorkerState::Indexing;
+        runtime.indexer_state.progress_percent = progress.percent();
+        runtime.indexer_state.current_file = progress.current_file.clone();
+        runtime.summary.indexed_files_count = progress.files_completed as u64;
+        drop(workers);
+
+        self.update_project_state(project_id, "indexing", None)?;
+        self.persist_worker_state(project_id)
+    }
+
+    fn apply_index_report(&self, project_id: &str, report: &IndexReport) -> Result<()> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire worker state lock"))?;
+        let runtime = workers
+            .get_mut(project_id)
+            .ok_or_else(|| anyhow!("worker {project_id} not found"))?;
+        runtime.summary.indexed_files_count = report.files_total as u64;
+        runtime.indexer_state.progress_percent = Some(100.0);
+        runtime.indexer_state.current_file = None;
+        drop(workers);
+
+        self.persist_worker_state(project_id)
+    }
+
+    fn persist_worker_state(&self, project_id: &str) -> Result<()> {
+        let snapshot = {
+            let workers = self
+                .workers
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire worker state lock"))?;
+            let runtime = workers
+                .get(project_id)
+                .ok_or_else(|| anyhow!("worker {project_id} not found"))?;
+            WorkerStatePersist {
+                summary: runtime.snapshot(),
+                last_error: runtime.last_error.clone(),
+                indexer_state: runtime.indexer_state.clone(),
+            }
+        };
+
+        let worker_dir = self.runtime_dir.join("projects").join(project_id);
+        fs::create_dir_all(&worker_dir)
+            .with_context(|| format!("failed to create worker dir {}", worker_dir.display()))?;
+        let state_file = worker_dir.join("worker-state.json");
+        let content = serde_json::to_vec_pretty(&snapshot)?;
+        fs::write(&state_file, content)
+            .with_context(|| format!("failed to persist worker state to {}", state_file.display()))
+    }
+
+    fn worker_status(&self, project_id: &str) -> Option<WorkerStatus> {
+        let (summary, indexer_state, is_watching) = {
+            let runtime = self.runtime.lock().ok()?;
+            let is_watching = runtime
+                .get(project_id)
+                .map(|entry| entry.info.watch)
+                .unwrap_or(false);
+            drop(runtime);
+            let workers = self.workers.lock().ok()?;
+            let worker = workers.get(project_id)?;
+            (worker.snapshot(), worker.indexer_state.clone(), is_watching)
+        };
+
+        Some(WorkerStatus {
+            indexer_state,
+            summary,
+            task_queue_size: 0,
+            is_watching,
+        })
+    }
+
+    fn master_status(&self) -> Result<MasterStatus> {
+        let workers = {
+            let guard = self
+                .workers
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire worker state lock"))?;
+            guard.values().map(|w| w.snapshot()).collect()
+        };
+
+        Ok(MasterStatus {
+            pid: std::process::id(),
+            uptime_secs: 0,
+            workers,
+        })
+    }
+
+    fn resolve_project(&self, project: &ProjectRef) -> Option<RegistryEntry> {
+        let registry = self.registry.lock().ok()?;
+        match project {
+            ProjectRef::Path(path) => fs::canonicalize(path).ok().and_then(|canonical| {
+                registry
+                    .contains_root(&canonical)
+                    .map(|entry| entry.clone())
+            }),
+            ProjectRef::Id(id) => registry.by_id(id).cloned(),
+        }
+    }
+
+    fn list_projects(&self) -> Result<Vec<ProjectInfo>> {
+        let registry_entries = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow!("failed to acquire registry lock"))?;
+            registry.all()
+        };
+
+        registry_entries
+            .iter()
+            .map(|entry| self.project_info_for(entry))
+            .collect()
+    }
+
+    fn project_status(&self, project: &ProjectRef) -> Result<ProjectInfo> {
+        let entry = self
+            .resolve_project(project)
+            .ok_or_else(|| anyhow!("project not found"))?;
+        self.project_info_for(&entry)
+    }
+
+    fn restart_projects(&self, projects: Vec<ProjectRef>) -> Result<Vec<ProjectInfo>> {
+        let mut restarted = Vec::new();
+        for project in projects {
+            let entry = match self.resolve_project(&project) {
+                Some(entry) => entry,
+                None => bail!("project not found"),
+            };
+
+            self.update_project_state(&entry.project_id, "restarting", None)?;
+            {
+                let mut workers = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire worker state lock"))?;
+                workers.remove(&entry.project_id);
+            }
+
+            let request = ProjectAddRequest {
+                project_root: entry.project_root.clone(),
+                id: Some(entry.project_id.clone()),
+                autostart: entry.autostart,
+                watch: entry.watch,
+                index_mode: entry.index_mode.clone(),
+                model: entry.model.clone(),
+            };
+            self.spawn_worker(entry.clone(), request)?;
+            restarted.push(self.project_info_for(&entry)?);
+        }
+        Ok(restarted)
+    }
+
+    fn project_info_for(&self, entry: &RegistryEntry) -> Result<ProjectInfo> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire runtime state lock"))?;
+        if let Some(existing) = runtime.get(&entry.project_id) {
+            return Ok(existing.info.clone());
+        }
+
+        let info = ProjectInfo {
+            project_id: entry.project_id.clone(),
+            project_root: entry.project_root.clone(),
+            autostart: entry.autostart,
+            watch: entry.watch,
+            index_mode: entry.index_mode.clone(),
+            model: entry.model.clone(),
+            state: entry
+                .last_state
+                .clone()
+                .unwrap_or_else(|| "pending".to_string()),
+        };
+
+        runtime.insert(
+            entry.project_id.clone(),
+            ProjectRuntimeEntry {
+                info: info.clone(),
+                last_error: None,
+            },
+        );
+
+        Ok(info)
+    }
+}
+
+fn worker_state_label(state: &WorkerState) -> &'static str {
+    match state {
+        WorkerState::Running | WorkerState::Idle | WorkerState::Indexing => "running",
+        WorkerState::Paused => "paused",
+        WorkerState::Failed => "failed",
+        WorkerState::Starting => "starting",
+        WorkerState::Stopping => "stopping",
     }
 }
 
@@ -680,6 +1258,35 @@ fn generate_project_id(path: &Path) -> String {
 struct PartialListRequest {
     filter: Option<String>,
     limit: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectRuntimeEntry {
+    info: ProjectInfo,
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct WorkerRuntimeEntry {
+    summary: WorkerSummary,
+    started_at: Instant,
+    last_error: Option<String>,
+    indexer_state: IndexerState,
+}
+
+impl WorkerRuntimeEntry {
+    fn snapshot(&self) -> WorkerSummary {
+        let mut summary = self.summary.clone();
+        summary.uptime_secs = self.started_at.elapsed().as_secs();
+        summary
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerStatePersist {
+    summary: WorkerSummary,
+    last_error: Option<String>,
+    indexer_state: IndexerState,
 }
 
 fn print_start_feedback(config: &MasterConfig, registry: &ProjectRegistry) {
@@ -792,9 +1399,22 @@ impl LoggingGuards {
 struct RegistryEntry {
     project_id: String,
     project_root: PathBuf,
+    #[serde(default)]
+    autostart: bool,
+    #[serde(default)]
+    watch: bool,
+    #[serde(default = "default_index_mode")]
+    index_mode: IndexMode,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     last_running: bool,
     #[serde(default)]
     last_state: Option<String>,
+}
+
+fn default_index_mode() -> IndexMode {
+    IndexMode::Auto
 }
 
 #[derive(Debug)]
@@ -837,10 +1457,39 @@ impl ProjectRegistry {
         self.entries.get(key.as_ref())
     }
 
+    fn contains_root_mut(&mut self, path: &Path) -> Option<&mut RegistryEntry> {
+        let key = path.to_string_lossy();
+        self.entries.get_mut(key.as_ref())
+    }
+
     fn contains_id(&self, project_id: &str) -> Option<&RegistryEntry> {
         self.entries
             .values()
             .find(|entry| entry.project_id == project_id)
+    }
+
+    fn by_id(&self, project_id: &str) -> Option<&RegistryEntry> {
+        self.entries
+            .values()
+            .find(|entry| entry.project_id == project_id)
+    }
+
+    fn by_id_mut(&mut self, project_id: &str) -> Option<&mut RegistryEntry> {
+        self.entries
+            .values_mut()
+            .find(|entry| entry.project_id == project_id)
+    }
+
+    fn all(&self) -> Vec<RegistryEntry> {
+        self.entries.values().cloned().collect()
+    }
+
+    fn mark_running(&mut self, project_id: &str, running: bool) -> Result<()> {
+        if let Some(entry) = self.by_id_mut(project_id) {
+            entry.last_running = running;
+            return self.persist();
+        }
+        bail!("project {project_id} not found in registry")
     }
 
     fn add(&mut self, entry: RegistryEntry) -> Result<()> {
@@ -1432,78 +2081,85 @@ fn read_pid_file(path: &Path) -> Result<PidInfo> {
     Ok(PidInfo { pid, socket })
 }
 
+#[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    cfg_if! {
-        if #[cfg(unix)] {
-            unsafe {
-                let res = libc::kill(pid as libc::pid_t, 0);
-                if res == 0 {
-                    true
-                } else {
-                    match io::Error::last_os_error().raw_os_error() {
-                        Some(code) if code == libc::EPERM => true,
-                        Some(code) if code == libc::ESRCH => false,
-                        _ => false,
-                    }
-                }
-            }
-        } else if #[cfg(windows)] {
-            use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-            use windows_sys::Win32::System::Threading::{
-                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
-            };
-
-            unsafe {
-                let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
-                if handle == 0 {
-                    return false;
-                }
-                let mut exit_code = 0;
-                let ok = GetExitCodeProcess(handle, &mut exit_code);
-                CloseHandle(handle);
-                ok != 0 && exit_code == STILL_ACTIVE
-            }
+    unsafe {
+        let res = libc::kill(pid as libc::pid_t, 0);
+        if res == 0 {
+            true
         } else {
-            false
+            match io::Error::last_os_error().raw_os_error() {
+                Some(code) if code == libc::EPERM => true,
+                Some(code) if code == libc::ESRCH => false,
+                _ => false,
+            }
         }
     }
 }
 
-fn send_signal(pid: u32, force: bool) -> Result<()> {
-    cfg_if! {
-        if #[cfg(unix)] {
-            let signo = if force { libc::SIGKILL } else { libc::SIGTERM };
-            let res = unsafe { libc::kill(pid as libc::pid_t, signo) };
-            if res == 0 {
-                Ok(())
-            } else {
-                match io::Error::last_os_error().raw_os_error() {
-                    Some(code) if code == libc::ESRCH => Ok(()),
-                    _ => Err(io::Error::last_os_error()).context("无法发送信号"),
-                }
-            }
-        } else if #[cfg(windows)] {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
 
-            unsafe {
-                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                if handle == 0 {
-                    return Err(io::Error::last_os_error()).context("无法打开进程句柄");
-                }
-                let ok = TerminateProcess(handle, 0);
-                CloseHandle(handle);
-                if ok == 0 {
-                    Err(io::Error::last_os_error()).context("无法终止进程")
-                } else {
-                    Ok(())
-                }
-            }
-        } else {
-            let _ = force;
-            Err(anyhow!("当前平台不支持 stop 命令"))
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        let mut exit_code = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, force: bool) -> Result<()> {
+    let signo = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let res = unsafe { libc::kill(pid as libc::pid_t, signo) };
+    if res == 0 {
+        Ok(())
+    } else {
+        match io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::ESRCH => Ok(()),
+            _ => Err(io::Error::last_os_error()).context("无法发送信号"),
         }
     }
+}
+
+#[cfg(windows)]
+fn send_signal(pid: u32, force: bool) -> Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let _ = force;
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle == 0 {
+            return Err(io::Error::last_os_error()).context("无法打开进程句柄");
+        }
+        let ok = TerminateProcess(handle, 0);
+        CloseHandle(handle);
+        if ok == 0 {
+            Err(io::Error::last_os_error()).context("无法终止进程")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn send_signal(pid: u32, force: bool) -> Result<()> {
+    let _ = (pid, force);
+    Err(anyhow!("当前平台不支持 stop 命令"))
 }
 
 #[derive(Clone, Debug)]
