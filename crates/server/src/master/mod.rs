@@ -478,11 +478,11 @@ fn handle_rpc_request(request: Request) -> Response {
             state: "registered".to_string(),
         }),
         Request::ProjectRemove(req) => Response::ProjectRemove(ProjectRemoveResponse {
-            project_id: match req.project {
+            project_id: match &req.project {
                 ProjectRef::Path(path) => format!("proj-{path}"),
-                ProjectRef::Id(id) => id,
+                ProjectRef::Id(id) => id.clone(),
             },
-            project_root: match req.project {
+            project_root: match &req.project {
                 ProjectRef::Path(path) => PathBuf::from(path),
                 ProjectRef::Id(id) => PathBuf::from(id),
             },
