@@ -687,6 +687,13 @@ impl MasterState {
             }
 
             return Ok((existing.clone(), true));
+        if let Some(entry) = registry.contains_root(&canonical) {
+            info!(
+                project_root = %canonical.display(),
+                project_id = %entry.project_id,
+                "project already registered",
+            );
+            return Ok((entry.clone(), true));
         }
 
         let project_id = if let Some(custom) = req.id.clone() {
