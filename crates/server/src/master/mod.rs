@@ -1,20 +1,21 @@
 use std::{
-    collections::BTreeMap,
+    collections::{hash_map::DefaultHasher, BTreeMap},
     ffi::OsStr,
     fs::{self, File},
+    hash::{Hash, Hasher},
     io::{self, Write},
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use axum::{routing::post, Json, Router};
+use axum::{extract::State, routing::post, Json, Router};
 use cfg_if::cfg_if;
 use chrono::Utc;
 use clap::ValueEnum;
@@ -72,10 +73,17 @@ pub struct RestartCommand {
     pub stop: StopCommand,
 }
 
+#[derive(Clone)]
+struct MasterState {
+    registry: Arc<Mutex<ProjectRegistry>>,
+}
+
 pub async fn run_start(args: StartCommand) -> Result<()> {
     let config = MasterConfig::load(&args)?;
     let _lock = MasterLock::acquire(&config)?;
     let logging = LoggingGuards::init(&config)?;
+
+    let registry = Arc::new(Mutex::new(ProjectRegistry::load(&config)?));
 
     if args.wait_ready {
         debug!(
@@ -90,11 +98,15 @@ pub async fn run_start(args: StartCommand) -> Result<()> {
         warn!("后台模式尚未实现，当前进程将以前台模式运行");
     }
 
-    let registry = ProjectRegistry::load(&config)?;
-    apply_autostart(&config, &registry)?;
+    {
+        let registry_guard = registry
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire registry lock"))?;
+        apply_autostart(&config, &registry_guard)?;
+        print_start_feedback(&config, &registry_guard);
+    }
 
-    print_start_feedback(&config, &registry);
-    run_main_loop(&config, logging).await
+    run_main_loop(&config, logging, registry).await
 }
 
 pub fn run_stop(args: StopCommand) -> Result<()> {
@@ -183,7 +195,12 @@ pub async fn run_restart(cmd: RestartCommand) -> Result<()> {
     run_start(cmd.start).await
 }
 
-async fn run_main_loop(config: &MasterConfig, _logging: LoggingGuards) -> Result<()> {
+async fn run_main_loop(
+    config: &MasterConfig,
+    _logging: LoggingGuards,
+    registry: Arc<Mutex<ProjectRegistry>>,
+) -> Result<()> {
+    let state = MasterState { registry };
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_flag = shutdown.clone();
     ctrlc::set_handler(move || {
@@ -213,6 +230,7 @@ async fn run_main_loop(config: &MasterConfig, _logging: LoggingGuards) -> Result
         .route("/project/list", post(project_list_handler))
         .route("/project/status", post(project_status_handler))
         .route("/project/restart", post(project_restart_handler))
+        .with_state(state)
         .layer(cors);
 
     let mut listener_tasks = Vec::new();
@@ -286,109 +304,166 @@ async fn run_uds_listener(path: PathBuf, _app: Router) -> Result<()> {
     Ok(())
 }
 
-async fn rpc_handler(Json(request): Json<Request>) -> Json<Response> {
+async fn rpc_handler(
+    State(state): State<MasterState>,
+    Json(request): Json<Request>,
+) -> Json<Response> {
     tracing::debug!(?request, "received request");
-    let response = handle_rpc_request(request);
+    let response = handle_rpc_request(&state, request);
     Json(response)
 }
 
-async fn info_handler(Json(req): Json<InfoRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::Info(req)))
+async fn info_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<InfoRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Info(req)))
 }
 
-async fn status_handler(Json(req): Json<StatusRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::Status(req)))
+async fn status_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<StatusRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Status(req)))
 }
 
-async fn search_handler(Json(req): Json<SearchRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::Search(req)))
+async fn search_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<SearchRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Search(req)))
 }
 
-async fn goto_handler(Json(req): Json<GotoRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::Goto(req)))
+async fn goto_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<GotoRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Goto(req)))
 }
 
-async fn list_handler(Json(req): Json<ListRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::List(req)))
+async fn list_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<ListRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::List(req)))
 }
 
-async fn list_classes_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+async fn list_classes_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<PartialListRequest>,
+) -> Json<Response> {
     let req = ListRequest {
         kind: ListKind::Classes,
         filter: req.filter,
         limit: req.limit,
     };
-    Json(handle_rpc_request(Request::List(req)))
+    Json(handle_rpc_request(&state, Request::List(req)))
 }
 
-async fn list_methods_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+async fn list_methods_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<PartialListRequest>,
+) -> Json<Response> {
     let req = ListRequest {
         kind: ListKind::Methods,
         filter: req.filter,
         limit: req.limit,
     };
-    Json(handle_rpc_request(Request::List(req)))
+    Json(handle_rpc_request(&state, Request::List(req)))
 }
 
-async fn list_files_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+async fn list_files_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<PartialListRequest>,
+) -> Json<Response> {
     let req = ListRequest {
         kind: ListKind::Files,
         filter: req.filter,
         limit: req.limit,
     };
-    Json(handle_rpc_request(Request::List(req)))
+    Json(handle_rpc_request(&state, Request::List(req)))
 }
 
-async fn list_tree_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+async fn list_tree_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<PartialListRequest>,
+) -> Json<Response> {
     let req = ListRequest {
         kind: ListKind::Tree,
         filter: req.filter,
         limit: req.limit,
     };
-    Json(handle_rpc_request(Request::List(req)))
+    Json(handle_rpc_request(&state, Request::List(req)))
 }
 
-async fn index_handler(Json(req): Json<IndexRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::Index(req)))
+async fn index_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<IndexRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Index(req)))
 }
 
-async fn index_full_handler() -> Json<Response> {
-    Json(handle_rpc_request(Request::Index(IndexRequest {
-        mode: IndexMode::Full,
-    })))
+async fn index_full_handler(State(state): State<MasterState>) -> Json<Response> {
+    Json(handle_rpc_request(
+        &state,
+        Request::Index(IndexRequest {
+            mode: IndexMode::Full,
+        }),
+    ))
 }
 
-async fn index_incremental_handler() -> Json<Response> {
-    Json(handle_rpc_request(Request::Index(IndexRequest {
-        mode: IndexMode::Incremental,
-    })))
+async fn index_incremental_handler(State(state): State<MasterState>) -> Json<Response> {
+    Json(handle_rpc_request(
+        &state,
+        Request::Index(IndexRequest {
+            mode: IndexMode::Incremental,
+        }),
+    ))
 }
 
-async fn logs_handler(Json(req): Json<LogsRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::Logs(req)))
+async fn logs_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<LogsRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Logs(req)))
 }
 
-async fn project_add_handler(Json(req): Json<ProjectAddRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::ProjectAdd(req)))
+async fn project_add_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<ProjectAddRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::ProjectAdd(req)))
 }
 
-async fn project_remove_handler(Json(req): Json<ProjectRemoveRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::ProjectRemove(req)))
+async fn project_remove_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<ProjectRemoveRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::ProjectRemove(req)))
 }
 
-async fn project_list_handler(Json(req): Json<ProjectListRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::ProjectList(req)))
+async fn project_list_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<ProjectListRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::ProjectList(req)))
 }
 
-async fn project_status_handler(Json(req): Json<ProjectStatusRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::ProjectStatus(req)))
+async fn project_status_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<ProjectStatusRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::ProjectStatus(req)))
 }
 
-async fn project_restart_handler(Json(req): Json<ProjectRestartRequest>) -> Json<Response> {
-    Json(handle_rpc_request(Request::ProjectRestart(req)))
+async fn project_restart_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<ProjectRestartRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::ProjectRestart(req)))
 }
 
-fn handle_rpc_request(request: Request) -> Response {
+fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
     match request {
         Request::Info(req) => {
             if req.target.is_some() {
@@ -470,14 +545,13 @@ fn handle_rpc_request(request: Request) -> Response {
                 message: "日志服务尚未初始化".to_string(),
             }),
         },
-        Request::ProjectAdd(req) => Response::ProjectAdd(ProjectAddResponse {
-            project_id: req
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("proj-{}", req.project_root.display())),
-            project_root: req.project_root,
-            state: "registered".to_string(),
-        }),
+        Request::ProjectAdd(req) => match state.register_project(req) {
+            Ok(response) => Response::ProjectAdd(response),
+            Err(err) => Response::Error(ErrorBody {
+                code: ErrorCode::InvalidRequest,
+                message: format!("failed to register project: {err}"),
+            }),
+        },
         Request::ProjectRemove(req) => Response::ProjectRemove(ProjectRemoveResponse {
             project_id: match &req.project {
                 ProjectRef::Path(path) => format!("proj-{path}"),
@@ -530,6 +604,76 @@ fn handle_rpc_request(request: Request) -> Response {
                 .collect(),
         }),
     }
+}
+
+impl MasterState {
+    fn register_project(&self, req: ProjectAddRequest) -> Result<ProjectAddResponse> {
+        let canonical = fs::canonicalize(&req.project_root).with_context(|| {
+            format!("project path {} does not exist", req.project_root.display())
+        })?;
+        let metadata = fs::metadata(&canonical)
+            .with_context(|| format!("failed to read metadata for {}", canonical.display()))?;
+        if !metadata.is_dir() {
+            bail!("{} is not a directory", canonical.display());
+        }
+
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire registry lock"))?;
+
+        if let Some(entry) = registry.contains_root(&canonical) {
+            info!(
+                project_root = %canonical.display(),
+                project_id = %entry.project_id,
+                "project already registered"
+            );
+            return Ok(ProjectAddResponse {
+                project_id: entry.project_id.clone(),
+                project_root: entry.project_root.clone(),
+                state: "duplicate".to_string(),
+            });
+        }
+
+        let project_id = if let Some(custom) = req.id.clone() {
+            if let Some(existing) = registry.contains_id(&custom) {
+                bail!(
+                    "project id {custom} already registered for {}",
+                    existing.project_root.display()
+                );
+            }
+            custom
+        } else {
+            generate_project_id(&canonical)
+        };
+
+        let entry = RegistryEntry {
+            project_id: project_id.clone(),
+            project_root: canonical.clone(),
+            last_running: false,
+            last_state: Some("pending".to_string()),
+        };
+
+        registry.add(entry)?;
+
+        info!(
+            project_id = %project_id,
+            project_root = %canonical.display(),
+            "project registered and pending worker startup"
+        );
+
+        Ok(ProjectAddResponse {
+            project_id,
+            project_root: canonical,
+            state: "registered".to_string(),
+        })
+    }
+}
+
+fn generate_project_id(path: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -646,8 +790,10 @@ impl LoggingGuards {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RegistryEntry {
+    project_id: String,
     project_root: PathBuf,
     last_running: bool,
+    #[serde(default)]
     last_state: Option<String>,
 }
 
@@ -684,6 +830,33 @@ impl ProjectRegistry {
 
     fn project_count(&self) -> usize {
         self.entries.len()
+    }
+
+    fn contains_root(&self, path: &Path) -> Option<&RegistryEntry> {
+        let key = path.to_string_lossy();
+        self.entries.get(key.as_ref())
+    }
+
+    fn contains_id(&self, project_id: &str) -> Option<&RegistryEntry> {
+        self.entries
+            .values()
+            .find(|entry| entry.project_id == project_id)
+    }
+
+    fn add(&mut self, entry: RegistryEntry) -> Result<()> {
+        let key = entry.project_root.to_string_lossy().to_string();
+        self.entries.insert(key, entry);
+        self.persist()
+    }
+
+    fn persist(&self) -> Result<()> {
+        let file = RegistryFile {
+            version: 1,
+            projects: self.entries.values().cloned().collect(),
+        };
+        let json = serde_json::to_vec_pretty(&file)?;
+        fs::write(&self.path, json)
+            .with_context(|| format!("failed to write registry file {}", self.path.display()))
     }
 }
 
