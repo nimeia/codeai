@@ -653,6 +653,41 @@ impl MasterState {
             .lock()
             .map_err(|_| anyhow!("failed to acquire registry lock"))?;
 
+        if let Some(existing) = registry.contains_root_mut(&canonical) {
+            let mut updated = false;
+            if existing.autostart != req.autostart {
+                existing.autostart = req.autostart;
+                updated = true;
+            }
+            if existing.watch != req.watch {
+                existing.watch = req.watch;
+                updated = true;
+            }
+            if existing.index_mode != req.index_mode {
+                existing.index_mode = req.index_mode.clone();
+                updated = true;
+            }
+            if existing.model != req.model {
+                existing.model = req.model.clone();
+                updated = true;
+            }
+
+            if updated {
+                registry.persist()?;
+                info!(
+                    project_root = %canonical.display(),
+                    project_id = %existing.project_id,
+                    "project already registered; options updated",
+                );
+            } else {
+                info!(
+                    project_root = %canonical.display(),
+                    project_id = %existing.project_id,
+                    "project already registered",
+                );
+            }
+
+            return Ok((existing.clone(), true));
         if let Some(entry) = registry.contains_root(&canonical) {
             info!(
                 project_root = %canonical.display(),
@@ -677,6 +712,10 @@ impl MasterState {
         let entry = RegistryEntry {
             project_id: project_id.clone(),
             project_root: canonical.clone(),
+            autostart: req.autostart,
+            watch: req.watch,
+            index_mode: req.index_mode.clone(),
+            model: req.model.clone(),
             last_running: false,
             last_state: Some("pending".to_string()),
         };
@@ -709,13 +748,18 @@ impl MasterState {
         let info = ProjectInfo {
             project_id: entry.project_id.clone(),
             project_root: entry.project_root.clone(),
-            autostart: source.map(|s| s.autostart).unwrap_or(false),
-            watch: source.map(|s| s.watch).unwrap_or(false),
+            autostart: source.map(|s| s.autostart).unwrap_or(entry.autostart),
+            watch: source.map(|s| s.watch).unwrap_or(entry.watch),
             index_mode: source
                 .map(|s| s.index_mode.clone())
-                .unwrap_or(IndexMode::Auto),
-            model: source.and_then(|s| s.model.clone()),
-            state: "pending".to_string(),
+                .unwrap_or(entry.index_mode.clone()),
+            model: source
+                .and_then(|s| s.model.clone())
+                .or_else(|| entry.model.clone()),
+            state: entry
+                .last_state
+                .clone()
+                .unwrap_or_else(|| "pending".to_string()),
         };
 
         runtime.insert(
@@ -1157,10 +1201,10 @@ impl MasterState {
             let request = ProjectAddRequest {
                 project_root: entry.project_root.clone(),
                 id: Some(entry.project_id.clone()),
-                autostart: false,
-                watch: false,
-                index_mode: IndexMode::Auto,
-                model: None,
+                autostart: entry.autostart,
+                watch: entry.watch,
+                index_mode: entry.index_mode.clone(),
+                model: entry.model.clone(),
             };
             self.spawn_worker(entry.clone(), request)?;
             restarted.push(self.project_info_for(&entry)?);
@@ -1180,10 +1224,10 @@ impl MasterState {
         let info = ProjectInfo {
             project_id: entry.project_id.clone(),
             project_root: entry.project_root.clone(),
-            autostart: entry.last_running,
-            watch: false,
-            index_mode: IndexMode::Auto,
-            model: None,
+            autostart: entry.autostart,
+            watch: entry.watch,
+            index_mode: entry.index_mode.clone(),
+            model: entry.model.clone(),
             state: entry
                 .last_state
                 .clone()
@@ -1363,9 +1407,22 @@ impl LoggingGuards {
 struct RegistryEntry {
     project_id: String,
     project_root: PathBuf,
+    #[serde(default)]
+    autostart: bool,
+    #[serde(default)]
+    watch: bool,
+    #[serde(default = "default_index_mode")]
+    index_mode: IndexMode,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     last_running: bool,
     #[serde(default)]
     last_state: Option<String>,
+}
+
+fn default_index_mode() -> IndexMode {
+    IndexMode::Auto
 }
 
 #[derive(Debug)]
@@ -1406,6 +1463,11 @@ impl ProjectRegistry {
     fn contains_root(&self, path: &Path) -> Option<&RegistryEntry> {
         let key = path.to_string_lossy();
         self.entries.get(key.as_ref())
+    }
+
+    fn contains_root_mut(&mut self, path: &Path) -> Option<&mut RegistryEntry> {
+        let key = path.to_string_lossy();
+        self.entries.get_mut(key.as_ref())
     }
 
     fn contains_id(&self, project_id: &str) -> Option<&RegistryEntry> {
