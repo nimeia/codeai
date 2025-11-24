@@ -16,7 +16,6 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{extract::State, routing::post, Json, Router};
-use cfg_if::cfg_if;
 use chrono::Utc;
 use clap::ValueEnum;
 use code_nav_core::indexer::{self, IndexJob, IndexProgress, IndexReport, IndexRunMode};
@@ -2089,78 +2088,85 @@ fn read_pid_file(path: &Path) -> Result<PidInfo> {
     Ok(PidInfo { pid, socket })
 }
 
+#[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    cfg_if! {
-        if #[cfg(unix)] {
-            unsafe {
-                let res = libc::kill(pid as libc::pid_t, 0);
-                if res == 0 {
-                    true
-                } else {
-                    match io::Error::last_os_error().raw_os_error() {
-                        Some(code) if code == libc::EPERM => true,
-                        Some(code) if code == libc::ESRCH => false,
-                        _ => false,
-                    }
-                }
-            }
-        } else if #[cfg(windows)] {
-            use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-            use windows_sys::Win32::System::Threading::{
-                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
-            };
-
-            unsafe {
-                let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
-                if handle == 0 {
-                    return false;
-                }
-                let mut exit_code = 0;
-                let ok = GetExitCodeProcess(handle, &mut exit_code);
-                CloseHandle(handle);
-                ok != 0 && exit_code == STILL_ACTIVE
-            }
+    unsafe {
+        let res = libc::kill(pid as libc::pid_t, 0);
+        if res == 0 {
+            true
         } else {
-            false
+            match io::Error::last_os_error().raw_os_error() {
+                Some(code) if code == libc::EPERM => true,
+                Some(code) if code == libc::ESRCH => false,
+                _ => false,
+            }
         }
     }
 }
 
-fn send_signal(pid: u32, force: bool) -> Result<()> {
-    cfg_if! {
-        if #[cfg(unix)] {
-            let signo = if force { libc::SIGKILL } else { libc::SIGTERM };
-            let res = unsafe { libc::kill(pid as libc::pid_t, signo) };
-            if res == 0 {
-                Ok(())
-            } else {
-                match io::Error::last_os_error().raw_os_error() {
-                    Some(code) if code == libc::ESRCH => Ok(()),
-                    _ => Err(io::Error::last_os_error()).context("无法发送信号"),
-                }
-            }
-        } else if #[cfg(windows)] {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
 
-            unsafe {
-                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                if handle == 0 {
-                    return Err(io::Error::last_os_error()).context("无法打开进程句柄");
-                }
-                let ok = TerminateProcess(handle, 0);
-                CloseHandle(handle);
-                if ok == 0 {
-                    Err(io::Error::last_os_error()).context("无法终止进程")
-                } else {
-                    Ok(())
-                }
-            }
-        } else {
-            let _ = force;
-            Err(anyhow!("当前平台不支持 stop 命令"))
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        let mut exit_code = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, force: bool) -> Result<()> {
+    let signo = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let res = unsafe { libc::kill(pid as libc::pid_t, signo) };
+    if res == 0 {
+        Ok(())
+    } else {
+        match io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::ESRCH => Ok(()),
+            _ => Err(io::Error::last_os_error()).context("无法发送信号"),
         }
     }
+}
+
+#[cfg(windows)]
+fn send_signal(pid: u32, force: bool) -> Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let _ = force;
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle == 0 {
+            return Err(io::Error::last_os_error()).context("无法打开进程句柄");
+        }
+        let ok = TerminateProcess(handle, 0);
+        CloseHandle(handle);
+        if ok == 0 {
+            Err(io::Error::last_os_error()).context("无法终止进程")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn send_signal(pid: u32, force: bool) -> Result<()> {
+    let _ = (pid, force);
+    Err(anyhow!("当前平台不支持 stop 命令"))
 }
 
 #[derive(Clone, Debug)]
