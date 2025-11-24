@@ -547,6 +547,7 @@ impl MasterConfig {
                 dir: args.log_dir.clone(),
                 worker_spool_dir: args.worker_log_spool.clone(),
                 file: None,
+                history_limit: None,
             });
         }
         if args.log_dir.is_some() || args.worker_log_spool.is_some() {
@@ -686,6 +687,7 @@ impl RawConfig {
                     dir: None,
                     worker_spool_dir: None,
                     file: None,
+                    history_limit: None,
                 });
             }
         }
