@@ -50,12 +50,12 @@ impl RpcClient for UnixSocketClient {
 }
 
 pub struct HttpClient {
-    url: String,
+    url: Url,
     client: reqwest::blocking::Client,
 }
 
 impl HttpClient {
-    pub fn new(url: String) -> Self {
+    pub fn new(url: Url) -> Self {
         Self {
             url,
             client: reqwest::blocking::Client::new(),
@@ -68,7 +68,7 @@ impl RpcClient for HttpClient {
         tracing::debug!(?request, "sending request via HTTP");
         let response = self
             .client
-            .post(&self.url)
+            .post(self.url.as_str())
             .json(request)
             .send()
             .context("failed to send HTTP request")?
@@ -96,7 +96,18 @@ pub fn new_rpc_client(address: &str) -> Result<Box<dyn RpcClient>> {
             }
             Ok(Box::new(UnixSocketClient::new(path)))
         }
-        "http" | "https" => Ok(Box::new(HttpClient::new(address.to_string()))),
+        "http" | "https" => {
+            let url = normalize_http_rpc_url(parsed_url);
+            Ok(Box::new(HttpClient::new(url)))
+        }
         _ => bail!("unsupported connection scheme: {}", parsed_url.scheme()),
     }
+}
+
+fn normalize_http_rpc_url(mut url: Url) -> Url {
+    if url.path() == "/" || url.path().is_empty() {
+        url.set_path("/rpc");
+    }
+
+    url
 }

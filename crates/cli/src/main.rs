@@ -16,11 +16,11 @@ use std::path::Path;
 #[derive(Parser)]
 #[command(name = "code-nav", version, about = "code navigation cli")]
 struct Cli {
-    /// Address of the code-nav daemon (e.g., http://localhost:6688, unix:///tmp/code-nav.sock)
+    /// Address of the code-nav daemon (e.g., http://localhost:6688/rpc, unix:///tmp/code-nav.sock)
     #[arg(
         long = "connect",
         global = true,
-        default_value = "http://localhost:6688"
+        default_value = "http://localhost:6688/rpc"
     )]
     connect: String,
     #[command(subcommand)]

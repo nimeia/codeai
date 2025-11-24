@@ -19,7 +19,13 @@ use cfg_if::cfg_if;
 use chrono::Utc;
 use clap::ValueEnum;
 use code_nav_protocol::{
-    InfoResponse, MasterInfo, MasterStatus, Request, Response, StatusResponse,
+    ErrorBody, ErrorCode, GotoRequest, GotoResponse, IndexMode, IndexRequest, IndexResponse,
+    InfoRequest, InfoResponse, ListItem, ListKind, ListRequest, ListResponse, LogsRequest,
+    MasterInfo, MasterStatus, ProjectAddRequest, ProjectAddResponse, ProjectInfo,
+    ProjectListRequest, ProjectListResponse, ProjectRef, ProjectRemoveRequest,
+    ProjectRemoveResponse, ProjectRestartRequest, ProjectRestartResponse, ProjectStatusRequest,
+    ProjectStatusResponse, Request, Response, SearchRequest, SearchResponse, StatusRequest,
+    StatusResponse,
 };
 use fslock::LockFile;
 use is_terminal::IsTerminal;
@@ -186,7 +192,28 @@ async fn run_main_loop(config: &MasterConfig, _logging: LoggingGuards) -> Result
     .context("failed to install ctrl-c handler")?;
 
     let cors = CorsLayer::new().allow_origin(Any);
-    let app = Router::new().route("/rpc", post(rpc_handler)).layer(cors);
+    let app = Router::new()
+        .route("/", post(rpc_handler))
+        .route("/rpc", post(rpc_handler))
+        .route("/info", post(info_handler))
+        .route("/status", post(status_handler))
+        .route("/search", post(search_handler))
+        .route("/goto", post(goto_handler))
+        .route("/list", post(list_handler))
+        .route("/list/classes", post(list_classes_handler))
+        .route("/list/methods", post(list_methods_handler))
+        .route("/list/files", post(list_files_handler))
+        .route("/list/tree", post(list_tree_handler))
+        .route("/index", post(index_handler))
+        .route("/index/full", post(index_full_handler))
+        .route("/index/incremental", post(index_incremental_handler))
+        .route("/logs", post(logs_handler))
+        .route("/project/add", post(project_add_handler))
+        .route("/project/remove", post(project_remove_handler))
+        .route("/project/list", post(project_list_handler))
+        .route("/project/status", post(project_status_handler))
+        .route("/project/restart", post(project_restart_handler))
+        .layer(cors);
 
     let mut listener_tasks = Vec::new();
 
@@ -265,6 +292,102 @@ async fn rpc_handler(Json(request): Json<Request>) -> Json<Response> {
     Json(response)
 }
 
+async fn info_handler(Json(req): Json<InfoRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::Info(req)))
+}
+
+async fn status_handler(Json(req): Json<StatusRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::Status(req)))
+}
+
+async fn search_handler(Json(req): Json<SearchRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::Search(req)))
+}
+
+async fn goto_handler(Json(req): Json<GotoRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::Goto(req)))
+}
+
+async fn list_handler(Json(req): Json<ListRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::List(req)))
+}
+
+async fn list_classes_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+    let req = ListRequest {
+        kind: ListKind::Classes,
+        filter: req.filter,
+        limit: req.limit,
+    };
+    Json(handle_rpc_request(Request::List(req)))
+}
+
+async fn list_methods_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+    let req = ListRequest {
+        kind: ListKind::Methods,
+        filter: req.filter,
+        limit: req.limit,
+    };
+    Json(handle_rpc_request(Request::List(req)))
+}
+
+async fn list_files_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+    let req = ListRequest {
+        kind: ListKind::Files,
+        filter: req.filter,
+        limit: req.limit,
+    };
+    Json(handle_rpc_request(Request::List(req)))
+}
+
+async fn list_tree_handler(Json(req): Json<PartialListRequest>) -> Json<Response> {
+    let req = ListRequest {
+        kind: ListKind::Tree,
+        filter: req.filter,
+        limit: req.limit,
+    };
+    Json(handle_rpc_request(Request::List(req)))
+}
+
+async fn index_handler(Json(req): Json<IndexRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::Index(req)))
+}
+
+async fn index_full_handler() -> Json<Response> {
+    Json(handle_rpc_request(Request::Index(IndexRequest {
+        mode: IndexMode::Full,
+    })))
+}
+
+async fn index_incremental_handler() -> Json<Response> {
+    Json(handle_rpc_request(Request::Index(IndexRequest {
+        mode: IndexMode::Incremental,
+    })))
+}
+
+async fn logs_handler(Json(req): Json<LogsRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::Logs(req)))
+}
+
+async fn project_add_handler(Json(req): Json<ProjectAddRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::ProjectAdd(req)))
+}
+
+async fn project_remove_handler(Json(req): Json<ProjectRemoveRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::ProjectRemove(req)))
+}
+
+async fn project_list_handler(Json(req): Json<ProjectListRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::ProjectList(req)))
+}
+
+async fn project_status_handler(Json(req): Json<ProjectStatusRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::ProjectStatus(req)))
+}
+
+async fn project_restart_handler(Json(req): Json<ProjectRestartRequest>) -> Json<Response> {
+    Json(handle_rpc_request(Request::ProjectRestart(req)))
+}
+
 fn handle_rpc_request(request: Request) -> Response {
     match request {
         Request::Info(req) => {
@@ -290,6 +413,38 @@ fn handle_rpc_request(request: Request) -> Response {
                 }))
             }
         }
+        Request::Search(_req) => Response::Search(SearchResponse { hits: vec![] }),
+        Request::Goto(_req) => Response::Goto(GotoResponse {
+            file: None,
+            line: None,
+        }),
+        Request::List(req) => match req.kind {
+            ListKind::Classes => Response::List(ListResponse {
+                items: vec![ListItem {
+                    name: "ExampleClass".into(),
+                    location: Some("src/example.rs:1".into()),
+                }],
+            }),
+            ListKind::Methods => Response::List(ListResponse {
+                items: vec![ListItem {
+                    name: "example_method".into(),
+                    location: Some("src/example.rs:10".into()),
+                }],
+            }),
+            ListKind::Files => Response::List(ListResponse {
+                items: vec![ListItem {
+                    name: "src/example.rs".into(),
+                    location: None,
+                }],
+            }),
+            ListKind::Tree => Response::List(ListResponse {
+                items: vec![ListItem {
+                    name: "/".into(),
+                    location: None,
+                }],
+            }),
+        },
+        Request::Index(_req) => Response::Index(IndexResponse { started: true }),
         Request::Status(req) => {
             if req.target.is_some() {
                 // Mock worker status response
@@ -310,17 +465,77 @@ fn handle_rpc_request(request: Request) -> Response {
         }
         Request::Logs(req) => match logs::global() {
             Some(service) => service.handle_request(req),
-            None => Response::Error(code_nav_protocol::ErrorBody {
-                code: code_nav_protocol::ErrorCode::InternalError,
+            None => Response::Error(ErrorBody {
+                code: ErrorCode::InternalError,
                 message: "日志服务尚未初始化".to_string(),
             }),
         },
-        // Add other request handlers here, returning mock data for now
-        _ => Response::Error(code_nav_protocol::ErrorBody {
-            code: code_nav_protocol::ErrorCode::Unsupported,
-            message: "Request type not supported yet".to_string(),
+        Request::ProjectAdd(req) => Response::ProjectAdd(ProjectAddResponse {
+            project_id: req
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("proj-{}", req.project_root.display())),
+            project_root: req.project_root,
+            state: "registered".to_string(),
+        }),
+        Request::ProjectRemove(req) => Response::ProjectRemove(ProjectRemoveResponse {
+            project_id: match &req.project {
+                ProjectRef::Path(path) => format!("proj-{path}"),
+                ProjectRef::Id(id) => id.clone(),
+            },
+            project_root: match &req.project {
+                ProjectRef::Path(path) => PathBuf::from(path),
+                ProjectRef::Id(id) => PathBuf::from(id),
+            },
+        }),
+        Request::ProjectList(_req) => {
+            Response::ProjectList(ProjectListResponse { projects: vec![] })
+        }
+        Request::ProjectStatus(req) => Response::ProjectStatus(ProjectStatusResponse {
+            info: ProjectInfo {
+                project_id: match &req.project {
+                    ProjectRef::Path(path) => format!("proj-{path}"),
+                    ProjectRef::Id(id) => id.clone(),
+                },
+                project_root: match &req.project {
+                    ProjectRef::Path(path) => PathBuf::from(path),
+                    ProjectRef::Id(id) => PathBuf::from(id),
+                },
+                autostart: false,
+                watch: false,
+                index_mode: IndexMode::Auto,
+                model: None,
+                state: "running".to_string(),
+            },
+        }),
+        Request::ProjectRestart(req) => Response::ProjectRestart(ProjectRestartResponse {
+            projects: req
+                .projects
+                .into_iter()
+                .map(|project| ProjectInfo {
+                    project_id: match &project {
+                        ProjectRef::Path(path) => format!("proj-{path}"),
+                        ProjectRef::Id(id) => id.clone(),
+                    },
+                    project_root: match &project {
+                        ProjectRef::Path(path) => PathBuf::from(path),
+                        ProjectRef::Id(id) => PathBuf::from(id),
+                    },
+                    autostart: false,
+                    watch: false,
+                    index_mode: IndexMode::Auto,
+                    model: None,
+                    state: "restarting".to_string(),
+                })
+                .collect(),
         }),
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PartialListRequest {
+    filter: Option<String>,
+    limit: Option<u32>,
 }
 
 fn print_start_feedback(config: &MasterConfig, registry: &ProjectRegistry) {
