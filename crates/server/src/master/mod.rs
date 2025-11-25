@@ -29,7 +29,8 @@ use code_nav_protocol::{
     ProjectListRequest, ProjectListResponse, ProjectRef, ProjectRemoveRequest,
     ProjectRemoveResponse, ProjectRestartRequest, ProjectRestartResponse, ProjectStatusRequest,
     ProjectStatusResponse, Request, Response, SearchRequest, SearchResponse, StatusRequest,
-    StatusResponse, WorkerInfo, WorkerState, WorkerStatus, WorkerSummary,
+    StatusResponse, TreeNode, TreeRequest, TreeResponse, WorkerInfo, WorkerState, WorkerStatus,
+    WorkerSummary,
 };
 use fslock::LockFile;
 use is_terminal::IsTerminal;
@@ -238,6 +239,7 @@ async fn run_main_loop(
         .route("/list/methods", post(list_methods_handler))
         .route("/list/files", post(list_files_handler))
         .route("/list/tree", post(list_tree_handler))
+        .route("/tree", post(tree_handler))
         .route("/index", post(index_handler))
         .route("/index/full", post(index_full_handler))
         .route("/index/incremental", post(index_incremental_handler))
@@ -413,6 +415,13 @@ async fn list_tree_handler(
     Json(handle_rpc_request(&state, Request::List(req)))
 }
 
+async fn tree_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<TreeRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Tree(req)))
+}
+
 async fn index_handler(
     State(state): State<MasterState>,
     Json(req): Json<IndexRequest>,
@@ -550,6 +559,7 @@ fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
                 }],
             }),
         },
+        Request::Tree(req) => Response::Tree(mock_tree_response(req)),
         Request::Index(req) => {
             state.trigger_index_jobs(req.mode);
             Response::Index(IndexResponse { started: true })
@@ -1438,6 +1448,108 @@ fn generate_project_id(path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn mock_tree_response(req: TreeRequest) -> TreeResponse {
+    let base = req.path.unwrap_or_else(|| "/".to_string());
+    let root_path = if base.is_empty() {
+        "/".to_string()
+    } else {
+        base.clone()
+    };
+
+    let mut children = vec![
+        TreeNode {
+            name: "src".into(),
+            path: append_path(&root_path, "src"),
+            is_dir: true,
+            children: vec![
+                TreeNode {
+                    name: "main.rs".into(),
+                    path: append_path(&append_path(&root_path, "src"), "main.rs"),
+                    is_dir: false,
+                    children: vec![],
+                },
+                TreeNode {
+                    name: "lib.rs".into(),
+                    path: append_path(&append_path(&root_path, "src"), "lib.rs"),
+                    is_dir: false,
+                    children: vec![],
+                },
+            ],
+        },
+        TreeNode {
+            name: "docs".into(),
+            path: append_path(&root_path, "docs"),
+            is_dir: true,
+            children: vec![TreeNode {
+                name: "README.md".into(),
+                path: append_path(&append_path(&root_path, "docs"), "README.md"),
+                is_dir: false,
+                children: vec![],
+            }],
+        },
+        TreeNode {
+            name: "Cargo.toml".into(),
+            path: append_path(&root_path, "Cargo.toml"),
+            is_dir: false,
+            children: vec![],
+        },
+    ];
+
+    let requested_depth = req.depth.unwrap_or(u32::MAX);
+    // Depth is measured from the root node. A depth of 0 means only the root is returned.
+    if requested_depth == 0 {
+        return TreeResponse {
+            root: TreeNode {
+                name: base,
+                path: root_path,
+                is_dir: true,
+                children: vec![],
+            },
+        };
+    }
+
+    if req.include_hidden {
+        children.push(TreeNode {
+            name: ".gitignore".into(),
+            path: append_path(&root_path, ".gitignore"),
+            is_dir: false,
+            children: vec![],
+        });
+    }
+
+    let mut root = TreeNode {
+        name: base.clone(),
+        path: root_path,
+        is_dir: true,
+        children,
+    };
+
+    prune_to_depth(&mut root, requested_depth);
+
+    TreeResponse { root }
+}
+
+fn append_path(root: &str, segment: &str) -> String {
+    if root.ends_with('/') {
+        format!("{root}{segment}")
+    } else if root.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{root}/{segment}")
+    }
+}
+
+fn prune_to_depth(node: &mut TreeNode, depth: u32) {
+    if depth == 0 {
+        node.children.clear();
+        return;
+    }
+
+    for child in &mut node.children {
+        prune_to_depth(child, depth - 1);
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
