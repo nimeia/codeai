@@ -18,7 +18,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::{extract::State, routing::post, Json, Router};
 use chrono::Utc;
 use clap::ValueEnum;
-use code_nav_core::indexer::{self, IndexJob, IndexProgress, IndexReport, IndexRunMode};
+use code_nav_core::{
+    indexer::{self, IndexJob, IndexProgress, IndexReport, IndexRunMode},
+    watcher,
+};
 use code_nav_protocol::{
     ErrorBody, ErrorCode, GotoRequest, GotoResponse, IndexMode, IndexRequest, IndexResponse,
     IndexerState, InfoRequest, InfoResponse, ListItem, ListKind, ListRequest, ListResponse,
@@ -547,7 +550,10 @@ fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
                 }],
             }),
         },
-        Request::Index(_req) => Response::Index(IndexResponse { started: true }),
+        Request::Index(req) => {
+            state.trigger_index_jobs(req.mode);
+            Response::Index(IndexResponse { started: true })
+        }
         Request::Status(req) => match req
             .target
             .as_ref()
@@ -923,21 +929,12 @@ impl MasterState {
             return;
         }
 
-        let project_id = entry.project_id.clone();
-        let project_root = entry.project_root.clone();
-        let state_for_progress = self.clone();
-        let index_result = tokio::task::spawn_blocking(move || {
-            let job = IndexJob::new(project_root).with_mode(IndexRunMode::Full);
-            indexer::run_with_progress(job, |progress| {
-                if let Err(err) = state_for_progress.update_index_progress(&project_id, progress) {
-                    warn!(project_id = %project_id, error = %err, "failed to update index progress");
-                }
-            })
-        })
-        .await;
+        let index_result = self
+            .run_index_job_async(entry.clone(), IndexRunMode::Full)
+            .await;
 
         match index_result {
-            Ok(Ok(report)) => {
+            Ok(report) => {
                 if let Err(err) = self.apply_index_report(&entry.project_id, &report) {
                     warn!(
                         project_id = %entry.project_id,
@@ -971,31 +968,206 @@ impl MasterState {
                     symbols = report.symbols_indexed,
                     "worker is now running",
                 );
+
+                if entry.watch {
+                    if let Err(err) = self.start_incremental_watcher(&entry) {
+                        warn!(
+                            project_id = %entry.project_id,
+                            project_root = %entry.project_root.display(),
+                            error = %err,
+                            "failed to start file watcher",
+                        );
+                        if let Ok(mut runtime) = self.runtime.lock() {
+                            if let Some(rt) = runtime.get_mut(&entry.project_id) {
+                                rt.info.watch = false;
+                            }
+                        }
+                    } else {
+                        info!(
+                            project_id = %entry.project_id,
+                            project_root = %entry.project_root.display(),
+                            "file watcher activated",
+                        );
+                    }
+                }
             }
-            Ok(Err(err)) => {
-                warn!(
-                    project_id = %entry.project_id,
-                    error = %err,
-                    "indexer failed",
-                );
+            Err(err) => {
+                warn!(project_id = %entry.project_id, error = %err, "indexer failed");
                 let _ = self.set_worker_state(
                     &entry.project_id,
                     WorkerState::Failed,
                     Some(err.to_string()),
                 );
             }
-            Err(join_err) => {
-                warn!(
-                    project_id = %entry.project_id,
-                    error = %join_err,
-                    "indexer task join failed",
-                );
-                let _ = self.set_worker_state(
-                    &entry.project_id,
-                    WorkerState::Failed,
-                    Some(join_err.to_string()),
-                );
+        }
+    }
+
+    async fn run_index_job_async(
+        &self,
+        entry: RegistryEntry,
+        mode: IndexRunMode,
+    ) -> Result<IndexReport> {
+        let state_for_progress = self.clone();
+        let project_id = entry.project_id.clone();
+        let project_root = entry.project_root.clone();
+        tokio::task::spawn_blocking(move || {
+            state_for_progress.run_index_job_blocking(&project_id, &project_root, mode)
+        })
+        .await
+        .context("indexer task join failed")?
+    }
+
+    fn run_index_job_blocking(
+        &self,
+        project_id: &str,
+        project_root: &Path,
+        mode: IndexRunMode,
+    ) -> Result<IndexReport> {
+        let job = IndexJob::new(project_root).with_mode(mode);
+        indexer::run_with_progress(job, |progress| {
+            if let Err(err) = self.update_index_progress(project_id, progress) {
+                warn!(project_id = %project_id, error = %err, "failed to update index progress");
             }
+        })
+    }
+
+    fn start_incremental_watcher(&self, entry: &RegistryEntry) -> Result<()> {
+        let project_id = entry.project_id.clone();
+        let project_root = entry.project_root.clone();
+        let state = self.clone();
+        let guard_for_watch = Arc::new(AtomicBool::new(false));
+
+        watcher::start(
+            project_root.clone(),
+            Duration::from_millis(300),
+            move || {
+                if guard_for_watch.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+
+                if let Err(err) = state.set_worker_state(&project_id, WorkerState::Indexing, None) {
+                    warn!(
+                        project_id = %project_id,
+                        error = %err,
+                        "failed to mark worker as indexing for watch event",
+                    );
+                    guard_for_watch.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                let result = state.run_index_job_blocking(
+                    &project_id,
+                    &project_root,
+                    IndexRunMode::Incremental,
+                );
+
+                match result {
+                    Ok(report) => {
+                        if let Err(err) = state.apply_index_report(&project_id, &report) {
+                            warn!(
+                                project_id = %project_id,
+                                error = %err,
+                                "failed to persist index report",
+                            );
+                        }
+                        if let Err(err) =
+                            state.set_worker_state(&project_id, WorkerState::Running, None)
+                        {
+                            warn!(
+                                project_id = %project_id,
+                                error = %err,
+                                "failed to mark worker as running",
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            project_id = %project_id,
+                            error = %err,
+                            "watch-triggered incremental index failed",
+                        );
+                        let _ = state.set_worker_state(
+                            &project_id,
+                            WorkerState::Failed,
+                            Some(err.to_string()),
+                        );
+                    }
+                }
+
+                guard_for_watch.store(false, Ordering::SeqCst);
+            },
+        )
+        .with_context(|| {
+            format!(
+                "failed to start watcher for project {}",
+                entry.project_root.display()
+            )
+        })?;
+
+        Ok(())
+    }
+
+    fn trigger_index_jobs(&self, mode: IndexMode) {
+        let entries = match self.registry.lock() {
+            Ok(registry) => registry.all(),
+            Err(_) => {
+                warn!("failed to acquire registry lock for index trigger");
+                return;
+            }
+        };
+
+        let run_mode = match mode {
+            IndexMode::Full => IndexRunMode::Full,
+            IndexMode::Auto | IndexMode::Incremental => IndexRunMode::Incremental,
+        };
+
+        for entry in entries {
+            let state = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    state.set_worker_state(&entry.project_id, WorkerState::Indexing, None)
+                {
+                    warn!(
+                        project_id = %entry.project_id,
+                        error = %err,
+                        "failed to mark worker as indexing",
+                    );
+                    return;
+                }
+
+                match state.run_index_job_async(entry.clone(), run_mode).await {
+                    Ok(report) => {
+                        if let Err(err) = state.apply_index_report(&entry.project_id, &report) {
+                            warn!(
+                                project_id = %entry.project_id,
+                                error = %err,
+                                "failed to persist index report",
+                            );
+                        }
+                        if let Err(err) =
+                            state.set_worker_state(&entry.project_id, WorkerState::Running, None)
+                        {
+                            warn!(
+                                project_id = %entry.project_id,
+                                error = %err,
+                                "failed to mark worker as running",
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            project_id = %entry.project_id,
+                            error = %err,
+                            "manual index trigger failed",
+                        );
+                        let _ = state.set_worker_state(
+                            &entry.project_id,
+                            WorkerState::Failed,
+                            Some(err.to_string()),
+                        );
+                    }
+                }
+            });
         }
     }
 
@@ -1067,6 +1239,7 @@ impl MasterState {
         runtime.indexer_state.state = WorkerState::Indexing;
         runtime.indexer_state.progress_percent = progress.percent();
         runtime.indexer_state.current_file = progress.current_file.clone();
+        runtime.summary.status = WorkerState::Indexing;
         runtime.summary.indexed_files_count = progress.files_completed as u64;
         drop(workers);
 
