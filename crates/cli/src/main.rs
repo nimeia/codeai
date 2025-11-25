@@ -5,7 +5,7 @@ mod formatter;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use code_nav_protocol::{
-    InfoRequest, ListKind, ProjectRef, Request, StatusRequest, StatusResponse,
+    InfoRequest, ListKind, ProjectRef, Request, StatusRequest, StatusResponse, TreeRequest,
 };
 use commands::{
     logs::{self, LogsArgs},
@@ -34,15 +34,14 @@ enum Commands {
         #[arg(default_value_t = 5)]
         top_k: u32,
     },
-    List {
-        #[arg(value_enum)]
-        kind: Kind,
-    },
+    List(ListArgs),
     Project {
         #[command(subcommand)]
         action: ProjectCommand,
     },
     Logs(LogsArgs),
+    /// Show a directory tree view
+    Tree(TreeArgs),
     /// Show information about the daemon or a specific project
     Info(InfoArgs),
     /// Show status of the daemon and all project workers
@@ -66,11 +65,41 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct TreeArgs {
+    /// Root path to start the tree from
+    #[arg(value_name = "PATH")]
+    pub path: Option<String>,
+
+    /// Maximum depth to traverse
+    #[arg(long)]
+    pub depth: Option<u32>,
+
+    /// Include hidden files and directories
+    #[arg(long)]
+    pub include_hidden: bool,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    #[arg(value_enum)]
+    kind: Kind,
+
+    /// Output in JSON format
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(clap::ValueEnum, Clone)]
 enum Kind {
     Classes,
     Methods,
     Files,
+    Tree,
 }
 
 pub struct CliContext {
@@ -88,14 +117,17 @@ fn main() -> Result<()> {
         Commands::Search { query, top_k } => {
             handle_search(&ctx, query, top_k)?;
         }
-        Commands::List { kind } => {
-            handle_list(&ctx, kind)?;
+        Commands::List(args) => {
+            handle_list(&ctx, args)?;
         }
         Commands::Project { action } => {
             project::run(&ctx, action)?;
         }
         Commands::Logs(args) => {
             logs::run(&ctx, args)?;
+        }
+        Commands::Tree(args) => {
+            handle_tree(&ctx, args)?;
         }
         Commands::Info(args) => {
             handle_info(&ctx, args)?;
@@ -115,11 +147,12 @@ fn handle_search(ctx: &CliContext, query: String, top_k: u32) -> Result<()> {
     Ok(())
 }
 
-fn handle_list(ctx: &CliContext, kind: Kind) -> Result<()> {
-    let list_kind = match kind {
+fn handle_list(ctx: &CliContext, args: ListArgs) -> Result<()> {
+    let list_kind = match args.kind {
         Kind::Classes => ListKind::Classes,
         Kind::Methods => ListKind::Methods,
         Kind::Files => ListKind::Files,
+        Kind::Tree => ListKind::Tree,
     };
     let request = Request::List(code_nav_protocol::ListRequest {
         kind: list_kind,
@@ -127,8 +160,48 @@ fn handle_list(ctx: &CliContext, kind: Kind) -> Result<()> {
         limit: None,
     });
     let response = ctx.client.send(&request)?;
-    // TODO: process list response
-    formatter::print_line(&serde_json::to_string_pretty(&response)?);
+
+    match response {
+        code_nav_protocol::Response::List(list_response) => {
+            if args.json {
+                formatter::print_line(&serde_json::to_string_pretty(&list_response)?);
+            } else {
+                formatter::print_list_response(list_kind, &list_response);
+            }
+        }
+        code_nav_protocol::Response::Error(err) => {
+            formatter::print_line(&format!("Error: {}", err.message));
+        }
+        _ => {
+            formatter::print_line("Error: received unexpected response type from server");
+        }
+    }
+    Ok(())
+}
+
+fn handle_tree(ctx: &CliContext, args: TreeArgs) -> Result<()> {
+    let request = Request::Tree(TreeRequest {
+        path: args.path,
+        depth: args.depth,
+        include_hidden: args.include_hidden,
+    });
+    let response = ctx.client.send(&request)?;
+
+    match response {
+        code_nav_protocol::Response::Tree(tree_response) => {
+            if args.json {
+                formatter::print_line(&serde_json::to_string_pretty(&tree_response)?);
+            } else {
+                formatter::print_tree_response(&tree_response);
+            }
+        }
+        code_nav_protocol::Response::Error(err) => {
+            formatter::print_line(&format!("Error: {}", err.message));
+        }
+        _ => {
+            formatter::print_line("Error: received unexpected response type from server");
+        }
+    }
     Ok(())
 }
 
