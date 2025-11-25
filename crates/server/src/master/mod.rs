@@ -1123,7 +1123,6 @@ impl MasterState {
 
         for entry in entries {
             let state = self.clone();
-            let run_mode = run_mode.clone();
             tokio::spawn(async move {
                 if let Err(err) =
                     state.set_worker_state(&entry.project_id, WorkerState::Indexing, None)

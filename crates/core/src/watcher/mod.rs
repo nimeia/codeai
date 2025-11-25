@@ -1,11 +1,10 @@
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use walkdir::WalkDir;
+use anyhow::Result;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 /// Start watching `root` and invoke `on_change` when filesystem events arrive.
 ///
@@ -15,17 +14,39 @@ pub fn start<F>(root: PathBuf, debounce: Duration, mut on_change: F) -> Result<(
 where
     F: FnMut() + Send + 'static,
 {
-    let mut snapshot = build_snapshot(&root)?;
+    let (tx, rx) = mpsc::channel();
 
-    let watch_root = root.clone();
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })?;
 
-    thread::spawn(move || loop {
-        thread::sleep(debounce);
-        match detect_changes(&watch_root, &mut snapshot) {
-            Ok(true) => on_change(),
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "file watch scan failed");
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+
+    thread::spawn(move || {
+        // Keep the watcher alive for the lifetime of the thread.
+        let _watcher = watcher;
+        let mut last_fired = Instant::now();
+        while let Ok(event) = rx.recv() {
+            match event {
+                Ok(ev)
+                    if matches!(
+                        ev.kind,
+                        EventKind::Any
+                            | EventKind::Create(_)
+                            | EventKind::Modify(_)
+                            | EventKind::Remove(_)
+                    ) =>
+                {
+                    if last_fired.elapsed() < debounce {
+                        continue;
+                    }
+                    last_fired = Instant::now();
+                    on_change();
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "file watch event error");
+                }
             }
         }
     });
