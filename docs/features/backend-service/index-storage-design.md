@@ -17,6 +17,11 @@
 └── logs/                # 组件日志（indexer / watcher / embedder）
 ```
 
+### 分支隔离与工作副本
+- **首选做法**：为需要长期索引的分支创建独立的工作副本（如 `git worktree`），每个副本下拥有独立的 `.code-nav/` 目录与 `metadata.db`，避免跨分支写锁争用与数据互相覆盖。
+- **单副本切换分支**：若在同一目录频繁切换分支，watcher 会捕获文件巨变并触发增量索引；但大改动可能导致 SQLite 重写范围大，推荐在切换后触发一次全量/增量刷新，或直接使用分支隔离的工作副本以保持写入串行且数据可追溯。
+- **命名约定**：如需在同一物理路径下保留多套索引，可通过配置或启动参数指定独立 runtime 目录（例如 `.code-nav-main/`、`.code-nav-feature-x/`），并在 `project add` 时按目录注册，保证 worker 定向落盘。
+
 ## SQLite schema（示例）
 - **files**：`id | path | lang | digest | size | mtime | version | is_deleted`
 - **ir_blobs**：`id | file_id | lang | schema_ver | ir_hash | stored_path? | created_at`
@@ -41,6 +46,10 @@
 - **单项目单 writer**：worker 负责串行化写入，避免 SQLite 锁竞争；
 - **短事务**：IR/符号/关系分批事务写入，缩短锁持有时间；
 - **崩溃恢复**：依赖 `version` + `ir_hash` 进行幂等比较，必要时重算 IR 并重写符号/向量。
+
+## 元数据后端选择
+- **默认继续使用 SQLite**：在“单项目单 writer + 分支隔离”前提下，SQLite 足以承载元数据写入与查询，便于分发与本地部署。
+- **扩展空间**：向量库仍可替换为 lancedb/sqlite-vector；若未来出现千万级符号或高并发写需求，可在保持 IR → 符号流水线不变的前提下，引入可插拔的元数据后端（例如嵌入式 KV/关系引擎）。
 
 ## 观测与回报
 - **指标**：每阶段记录文件数、IR 大小、符号/向量数量、耗时、失败样本；
