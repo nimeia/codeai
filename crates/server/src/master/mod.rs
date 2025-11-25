@@ -671,22 +671,28 @@ impl MasterState {
                 updated = true;
             }
 
-            if updated {
+            let project_root_display = canonical.display().to_string();
+            let project_id = existing.project_id.clone();
+            let existing_clone = existing.clone();
+            let updated_existing = updated;
+
+            if updated_existing {
                 registry.persist()?;
                 info!(
-                    project_root = %canonical.display(),
-                    project_id = %existing.project_id,
+                    project_root = %project_root_display,
+                    project_id = %project_id,
                     "project already registered; options updated",
                 );
             } else {
                 info!(
-                    project_root = %canonical.display(),
-                    project_id = %existing.project_id,
+                    project_root = %project_root_display,
+                    project_id = %project_id,
                     "project already registered",
                 );
             }
 
-            return Ok((existing.clone(), true));
+            return Ok((existing_clone, true));
+        }
         if let Some(entry) = registry.contains_root(&canonical) {
             info!(
                 project_root = %canonical.display(),
