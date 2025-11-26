@@ -94,7 +94,7 @@ struct ListArgs {
     json: bool,
 }
 
-#[derive(clap::ValueEnum, Clone)]
+#[derive(Debug, clap::ValueEnum, Clone)]
 enum Kind {
     Classes,
     Methods,
@@ -155,7 +155,7 @@ fn handle_list(ctx: &CliContext, args: ListArgs) -> Result<()> {
         Kind::Tree => ListKind::Tree,
     };
     let request = Request::List(code_nav_protocol::ListRequest {
-        kind: list_kind,
+        kind: list_kind.clone(),
         filter: None,
         limit: None,
     });

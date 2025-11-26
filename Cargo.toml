@@ -32,4 +32,3 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_
 libc = "0.2"
 cfg-if = "1"
 walkdir = "2"
-notify = "6"

@@ -1,10 +1,11 @@
-use std::path::PathBuf;
-use std::sync::mpsc;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use anyhow::{Context, Result};
+use walkdir::WalkDir;
 
 /// Start watching `root` and invoke `on_change` when filesystem events arrive.
 ///
@@ -14,40 +15,25 @@ pub fn start<F>(root: PathBuf, debounce: Duration, mut on_change: F) -> Result<(
 where
     F: FnMut() + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel();
-
-    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    })?;
-
-    watcher.watch(&root, RecursiveMode::Recursive)?;
+    let mut snapshot = build_snapshot(&root)?;
+    let watch_root = root.clone();
 
     thread::spawn(move || {
-        // Keep the watcher alive for the lifetime of the thread.
-        let _watcher = watcher;
         let mut last_fired = Instant::now();
-        while let Ok(event) = rx.recv() {
-            match event {
-                Ok(ev)
-                    if matches!(
-                        ev.kind,
-                        EventKind::Any
-                            | EventKind::Create(_)
-                            | EventKind::Modify(_)
-                            | EventKind::Remove(_)
-                    ) =>
-                {
-                    if last_fired.elapsed() < debounce {
-                        continue;
-                    }
+
+        loop {
+            match detect_changes(&watch_root, &mut snapshot) {
+                Ok(true) if last_fired.elapsed() >= debounce => {
                     last_fired = Instant::now();
                     on_change();
                 }
-                Ok(_) => {}
+                Ok(true) | Ok(false) => {}
                 Err(err) => {
-                    tracing::warn!(error = %err, "file watch event error");
+                    tracing::warn!(error = %err, "file watch poll error");
                 }
             }
+
+            thread::sleep(debounce);
         }
     });
 
@@ -57,7 +43,10 @@ where
 
 fn build_snapshot(root: &Path) -> Result<HashMap<PathBuf, std::time::SystemTime>> {
     let mut snapshot = HashMap::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -79,7 +68,10 @@ fn detect_changes(
     let mut changed = false;
     let mut next_snapshot = HashMap::new();
 
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
         if !entry.file_type().is_file() {
             continue;
         }
