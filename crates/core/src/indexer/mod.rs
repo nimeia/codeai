@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 
 use crate::embedding;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum IndexRunMode {
     Full,
     Incremental,
