@@ -695,11 +695,7 @@ impl MasterState {
                 );
             }
 
-<<<<<<< HEAD
-            return Ok((existing.clone(), true));
-=======
             return Ok((existing_clone, true));
->>>>>>> 14c121b53981364833ac23d134c9dc118e830b6b
         }
         if let Some(entry) = registry.contains_root(&canonical) {
             info!(
