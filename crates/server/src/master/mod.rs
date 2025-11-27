@@ -18,7 +18,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::{extract::State, routing::post, Json, Router};
 use chrono::Utc;
 use clap::ValueEnum;
-use code_nav_core::indexer::{self, IndexJob, IndexProgress, IndexReport, IndexRunMode};
+use code_nav_core::{
+    indexer::{self, IndexJob, IndexProgress, IndexReport, IndexRunMode},
+    watcher,
+};
 use code_nav_protocol::{
     ErrorBody, ErrorCode, GotoRequest, GotoResponse, IndexMode, IndexRequest, IndexResponse,
     IndexerState, InfoRequest, InfoResponse, ListItem, ListKind, ListRequest, ListResponse,
@@ -26,7 +29,8 @@ use code_nav_protocol::{
     ProjectListRequest, ProjectListResponse, ProjectRef, ProjectRemoveRequest,
     ProjectRemoveResponse, ProjectRestartRequest, ProjectRestartResponse, ProjectStatusRequest,
     ProjectStatusResponse, Request, Response, SearchRequest, SearchResponse, StatusRequest,
-    StatusResponse, WorkerInfo, WorkerState, WorkerStatus, WorkerSummary,
+    StatusResponse, TreeNode, TreeRequest, TreeResponse, WorkerInfo, WorkerState, WorkerStatus,
+    WorkerSummary,
 };
 use fslock::LockFile;
 use is_terminal::IsTerminal;
@@ -235,6 +239,7 @@ async fn run_main_loop(
         .route("/list/methods", post(list_methods_handler))
         .route("/list/files", post(list_files_handler))
         .route("/list/tree", post(list_tree_handler))
+        .route("/tree", post(tree_handler))
         .route("/index", post(index_handler))
         .route("/index/full", post(index_full_handler))
         .route("/index/incremental", post(index_incremental_handler))
@@ -410,6 +415,13 @@ async fn list_tree_handler(
     Json(handle_rpc_request(&state, Request::List(req)))
 }
 
+async fn tree_handler(
+    State(state): State<MasterState>,
+    Json(req): Json<TreeRequest>,
+) -> Json<Response> {
+    Json(handle_rpc_request(&state, Request::Tree(req)))
+}
+
 async fn index_handler(
     State(state): State<MasterState>,
     Json(req): Json<IndexRequest>,
@@ -547,7 +559,11 @@ fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
                 }],
             }),
         },
-        Request::Index(_req) => Response::Index(IndexResponse { started: true }),
+        Request::Tree(req) => Response::Tree(mock_tree_response(req)),
+        Request::Index(req) => {
+            state.trigger_index_jobs(req.mode);
+            Response::Index(IndexResponse { started: true })
+        }
         Request::Status(req) => match req
             .target
             .as_ref()
@@ -653,40 +669,37 @@ impl MasterState {
             .map_err(|_| anyhow!("failed to acquire registry lock"))?;
 
         if let Some(existing) = registry.contains_root_mut(&canonical) {
-            let mut updated = false;
-            if existing.autostart != req.autostart {
-                existing.autostart = req.autostart;
-                updated = true;
-            }
-            if existing.watch != req.watch {
-                existing.watch = req.watch;
-                updated = true;
-            }
-            if existing.index_mode != req.index_mode {
-                existing.index_mode = req.index_mode.clone();
-                updated = true;
-            }
-            if existing.model != req.model {
-                existing.model = req.model.clone();
-                updated = true;
-            }
+            let updated_existing = Self::update_registry_entry(
+                existing,
+                req.autostart,
+                req.watch,
+                &req.index_mode,
+                &req.model,
+            );
+            let project_root_display = canonical.display().to_string();
+            let project_id = existing.project_id.clone();
+            let existing_clone = existing.clone();
 
-            if updated {
+            if updated_existing {
                 registry.persist()?;
                 info!(
-                    project_root = %canonical.display(),
-                    project_id = %existing.project_id,
+                    project_root = %project_root_display,
+                    project_id = %project_id,
                     "project already registered; options updated",
                 );
             } else {
                 info!(
-                    project_root = %canonical.display(),
-                    project_id = %existing.project_id,
+                    project_root = %project_root_display,
+                    project_id = %project_id,
                     "project already registered",
                 );
             }
 
+<<<<<<< HEAD
             return Ok((existing.clone(), true));
+=======
+            return Ok((existing_clone, true));
+>>>>>>> 14c121b53981364833ac23d134c9dc118e830b6b
         }
         if let Some(entry) = registry.contains_root(&canonical) {
             info!(
@@ -729,6 +742,34 @@ impl MasterState {
         );
 
         Ok((entry, false))
+    }
+
+    fn update_registry_entry(
+        entry: &mut RegistryEntry,
+        autostart: bool,
+        watch: bool,
+        index_mode: &IndexMode,
+        model: &Option<String>,
+    ) -> bool {
+        let mut updated = false;
+        if entry.autostart != autostart {
+            entry.autostart = autostart;
+            updated = true;
+        }
+        if entry.watch != watch {
+            entry.watch = watch;
+            updated = true;
+        }
+        if entry.index_mode != *index_mode {
+            entry.index_mode = index_mode.clone();
+            updated = true;
+        }
+        if entry.model != *model {
+            entry.model = model.clone();
+            updated = true;
+        }
+
+        updated
     }
 
     fn ensure_runtime_entry(
@@ -918,21 +959,12 @@ impl MasterState {
             return;
         }
 
-        let project_id = entry.project_id.clone();
-        let project_root = entry.project_root.clone();
-        let state_for_progress = self.clone();
-        let index_result = tokio::task::spawn_blocking(move || {
-            let job = IndexJob::new(project_root).with_mode(IndexRunMode::Full);
-            indexer::run_with_progress(job, |progress| {
-                if let Err(err) = state_for_progress.update_index_progress(&project_id, progress) {
-                    warn!(project_id = %project_id, error = %err, "failed to update index progress");
-                }
-            })
-        })
-        .await;
+        let index_result = self
+            .run_index_job_async(entry.clone(), IndexRunMode::Full)
+            .await;
 
         match index_result {
-            Ok(Ok(report)) => {
+            Ok(report) => {
                 if let Err(err) = self.apply_index_report(&entry.project_id, &report) {
                     warn!(
                         project_id = %entry.project_id,
@@ -966,31 +998,206 @@ impl MasterState {
                     symbols = report.symbols_indexed,
                     "worker is now running",
                 );
+
+                if entry.watch {
+                    if let Err(err) = self.start_incremental_watcher(&entry) {
+                        warn!(
+                            project_id = %entry.project_id,
+                            project_root = %entry.project_root.display(),
+                            error = %err,
+                            "failed to start file watcher",
+                        );
+                        if let Ok(mut runtime) = self.runtime.lock() {
+                            if let Some(rt) = runtime.get_mut(&entry.project_id) {
+                                rt.info.watch = false;
+                            }
+                        }
+                    } else {
+                        info!(
+                            project_id = %entry.project_id,
+                            project_root = %entry.project_root.display(),
+                            "file watcher activated",
+                        );
+                    }
+                }
             }
-            Ok(Err(err)) => {
-                warn!(
-                    project_id = %entry.project_id,
-                    error = %err,
-                    "indexer failed",
-                );
+            Err(err) => {
+                warn!(project_id = %entry.project_id, error = %err, "indexer failed");
                 let _ = self.set_worker_state(
                     &entry.project_id,
                     WorkerState::Failed,
                     Some(err.to_string()),
                 );
             }
-            Err(join_err) => {
-                warn!(
-                    project_id = %entry.project_id,
-                    error = %join_err,
-                    "indexer task join failed",
-                );
-                let _ = self.set_worker_state(
-                    &entry.project_id,
-                    WorkerState::Failed,
-                    Some(join_err.to_string()),
-                );
+        }
+    }
+
+    async fn run_index_job_async(
+        &self,
+        entry: RegistryEntry,
+        mode: IndexRunMode,
+    ) -> Result<IndexReport> {
+        let state_for_progress = self.clone();
+        let project_id = entry.project_id.clone();
+        let project_root = entry.project_root.clone();
+        tokio::task::spawn_blocking(move || {
+            state_for_progress.run_index_job_blocking(&project_id, &project_root, mode)
+        })
+        .await
+        .context("indexer task join failed")?
+    }
+
+    fn run_index_job_blocking(
+        &self,
+        project_id: &str,
+        project_root: &Path,
+        mode: IndexRunMode,
+    ) -> Result<IndexReport> {
+        let job = IndexJob::new(project_root).with_mode(mode);
+        indexer::run_with_progress(job, |progress| {
+            if let Err(err) = self.update_index_progress(project_id, progress) {
+                warn!(project_id = %project_id, error = %err, "failed to update index progress");
             }
+        })
+    }
+
+    fn start_incremental_watcher(&self, entry: &RegistryEntry) -> Result<()> {
+        let project_id = entry.project_id.clone();
+        let project_root = entry.project_root.clone();
+        let state = self.clone();
+        let guard_for_watch = Arc::new(AtomicBool::new(false));
+
+        watcher::start(
+            project_root.clone(),
+            Duration::from_millis(300),
+            move || {
+                if guard_for_watch.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+
+                if let Err(err) = state.set_worker_state(&project_id, WorkerState::Indexing, None) {
+                    warn!(
+                        project_id = %project_id,
+                        error = %err,
+                        "failed to mark worker as indexing for watch event",
+                    );
+                    guard_for_watch.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                let result = state.run_index_job_blocking(
+                    &project_id,
+                    &project_root,
+                    IndexRunMode::Incremental,
+                );
+
+                match result {
+                    Ok(report) => {
+                        if let Err(err) = state.apply_index_report(&project_id, &report) {
+                            warn!(
+                                project_id = %project_id,
+                                error = %err,
+                                "failed to persist index report",
+                            );
+                        }
+                        if let Err(err) =
+                            state.set_worker_state(&project_id, WorkerState::Running, None)
+                        {
+                            warn!(
+                                project_id = %project_id,
+                                error = %err,
+                                "failed to mark worker as running",
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            project_id = %project_id,
+                            error = %err,
+                            "watch-triggered incremental index failed",
+                        );
+                        let _ = state.set_worker_state(
+                            &project_id,
+                            WorkerState::Failed,
+                            Some(err.to_string()),
+                        );
+                    }
+                }
+
+                guard_for_watch.store(false, Ordering::SeqCst);
+            },
+        )
+        .with_context(|| {
+            format!(
+                "failed to start watcher for project {}",
+                entry.project_root.display()
+            )
+        })?;
+
+        Ok(())
+    }
+
+    fn trigger_index_jobs(&self, mode: IndexMode) {
+        let entries = match self.registry.lock() {
+            Ok(registry) => registry.all(),
+            Err(_) => {
+                warn!("failed to acquire registry lock for index trigger");
+                return;
+            }
+        };
+
+        let run_mode = match mode {
+            IndexMode::Full => IndexRunMode::Full,
+            IndexMode::Auto | IndexMode::Incremental => IndexRunMode::Incremental,
+        };
+
+        for entry in entries {
+            let state = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    state.set_worker_state(&entry.project_id, WorkerState::Indexing, None)
+                {
+                    warn!(
+                        project_id = %entry.project_id,
+                        error = %err,
+                        "failed to mark worker as indexing",
+                    );
+                    return;
+                }
+
+                match state.run_index_job_async(entry.clone(), run_mode).await {
+                    Ok(report) => {
+                        if let Err(err) = state.apply_index_report(&entry.project_id, &report) {
+                            warn!(
+                                project_id = %entry.project_id,
+                                error = %err,
+                                "failed to persist index report",
+                            );
+                        }
+                        if let Err(err) =
+                            state.set_worker_state(&entry.project_id, WorkerState::Running, None)
+                        {
+                            warn!(
+                                project_id = %entry.project_id,
+                                error = %err,
+                                "failed to mark worker as running",
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            project_id = %entry.project_id,
+                            error = %err,
+                            "manual index trigger failed",
+                        );
+                        let _ = state.set_worker_state(
+                            &entry.project_id,
+                            WorkerState::Failed,
+                            Some(err.to_string()),
+                        );
+                    }
+                }
+            });
         }
     }
 
@@ -1062,6 +1269,7 @@ impl MasterState {
         runtime.indexer_state.state = WorkerState::Indexing;
         runtime.indexer_state.progress_percent = progress.percent();
         runtime.indexer_state.current_file = progress.current_file.clone();
+        runtime.summary.status = WorkerState::Indexing;
         runtime.summary.indexed_files_count = progress.files_completed as u64;
         drop(workers);
 
@@ -1260,6 +1468,108 @@ fn generate_project_id(path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn mock_tree_response(req: TreeRequest) -> TreeResponse {
+    let base = req.path.unwrap_or_else(|| "/".to_string());
+    let root_path = if base.is_empty() {
+        "/".to_string()
+    } else {
+        base.clone()
+    };
+
+    let mut children = vec![
+        TreeNode {
+            name: "src".into(),
+            path: append_path(&root_path, "src"),
+            is_dir: true,
+            children: vec![
+                TreeNode {
+                    name: "main.rs".into(),
+                    path: append_path(&append_path(&root_path, "src"), "main.rs"),
+                    is_dir: false,
+                    children: vec![],
+                },
+                TreeNode {
+                    name: "lib.rs".into(),
+                    path: append_path(&append_path(&root_path, "src"), "lib.rs"),
+                    is_dir: false,
+                    children: vec![],
+                },
+            ],
+        },
+        TreeNode {
+            name: "docs".into(),
+            path: append_path(&root_path, "docs"),
+            is_dir: true,
+            children: vec![TreeNode {
+                name: "README.md".into(),
+                path: append_path(&append_path(&root_path, "docs"), "README.md"),
+                is_dir: false,
+                children: vec![],
+            }],
+        },
+        TreeNode {
+            name: "Cargo.toml".into(),
+            path: append_path(&root_path, "Cargo.toml"),
+            is_dir: false,
+            children: vec![],
+        },
+    ];
+
+    let requested_depth = req.depth.unwrap_or(u32::MAX);
+    // Depth is measured from the root node. A depth of 0 means only the root is returned.
+    if requested_depth == 0 {
+        return TreeResponse {
+            root: TreeNode {
+                name: base,
+                path: root_path,
+                is_dir: true,
+                children: vec![],
+            },
+        };
+    }
+
+    if req.include_hidden {
+        children.push(TreeNode {
+            name: ".gitignore".into(),
+            path: append_path(&root_path, ".gitignore"),
+            is_dir: false,
+            children: vec![],
+        });
+    }
+
+    let mut root = TreeNode {
+        name: base.clone(),
+        path: root_path,
+        is_dir: true,
+        children,
+    };
+
+    prune_to_depth(&mut root, requested_depth);
+
+    TreeResponse { root }
+}
+
+fn append_path(root: &str, segment: &str) -> String {
+    if root.ends_with('/') {
+        format!("{root}{segment}")
+    } else if root.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{root}/{segment}")
+    }
+}
+
+fn prune_to_depth(node: &mut TreeNode, depth: u32) {
+    if depth == 0 {
+        node.children.clear();
+        return;
+    }
+
+    for child in &mut node.children {
+        prune_to_depth(child, depth - 1);
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

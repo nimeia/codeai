@@ -25,7 +25,10 @@ pub fn format_uptime(total_seconds: u64) -> String {
     parts.join(" ")
 }
 
-use code_nav_protocol::{InfoResponse, MasterInfo, MasterStatus, WorkerInfo, WorkerStatus};
+use code_nav_protocol::{
+    InfoResponse, ListKind, ListResponse, MasterInfo, MasterStatus, TreeNode, TreeResponse,
+    WorkerInfo, WorkerStatus,
+};
 use serde_json;
 
 pub fn print_info_response(response: InfoResponse) {
@@ -173,4 +176,94 @@ pub fn print_worker_status(status: WorkerStatus) {
         "{:<12} {} tasks pending",
         "Queue:", status.task_queue_size
     ));
+}
+
+pub fn print_list_response(kind: ListKind, response: &ListResponse) {
+    if response.items.is_empty() {
+        print_line("No items found.");
+        return;
+    }
+
+    if matches!(kind, ListKind::Tree) {
+        for item in &response.items {
+            print_line(&item.name);
+        }
+        return;
+    }
+
+    let name_header = match kind {
+        ListKind::Classes => "CLASS",
+        ListKind::Methods => "METHOD",
+        ListKind::Files => "FILE",
+        ListKind::Tree => "NODE",
+    };
+
+    let mut rows = Vec::with_capacity(response.items.len() + 1);
+    rows.push(vec![name_header.to_string(), "LOCATION".to_string()]);
+    for item in &response.items {
+        rows.push(vec![
+            item.name.clone(),
+            item.location.clone().unwrap_or_default(),
+        ]);
+    }
+
+    let mut widths = vec![0; rows[0].len()];
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    for (i, row) in rows.iter().enumerate() {
+        let formatted = row
+            .iter()
+            .enumerate()
+            .map(|(j, cell)| format!("{:<width$}", cell, width = widths[j]))
+            .collect::<Vec<_>>()
+            .join("  ");
+        print_line(&formatted);
+        if i == 0 {
+            let separator = widths
+                .iter()
+                .map(|w| "-".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("  ");
+            print_line(&separator);
+        }
+    }
+}
+
+pub fn print_tree_response(response: &TreeResponse) {
+    let root_label = if response.root.is_dir {
+        format!("{}/", response.root.name)
+    } else {
+        response.root.name.clone()
+    };
+    print_line(&root_label);
+
+    let last_index = response.root.children.len().saturating_sub(1);
+    for (idx, child) in response.root.children.iter().enumerate() {
+        print_tree_node(child, "", idx == last_index);
+    }
+}
+
+fn print_tree_node(node: &TreeNode, prefix: &str, is_last: bool) {
+    let connector = if is_last { "└── " } else { "├── " };
+    let label = if node.is_dir {
+        format!("{}/", node.name)
+    } else {
+        node.name.clone()
+    };
+    print_line(&format!("{}{}{}", prefix, connector, label));
+
+    let next_prefix = if is_last {
+        format!("{}    ", prefix)
+    } else {
+        format!("{}│   ", prefix)
+    };
+
+    let last_index = node.children.len().saturating_sub(1);
+    for (idx, child) in node.children.iter().enumerate() {
+        print_tree_node(child, &next_prefix, idx == last_index);
+    }
 }

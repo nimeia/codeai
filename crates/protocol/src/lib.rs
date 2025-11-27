@@ -11,6 +11,7 @@ pub enum Request {
     Search(SearchRequest),
     Goto(GotoRequest),
     List(ListRequest),
+    Tree(TreeRequest),
     Index(IndexRequest),
     Logs(LogsRequest),
 
@@ -30,6 +31,7 @@ pub enum Response {
     Search(SearchResponse),
     Goto(GotoResponse),
     List(ListResponse),
+    Tree(TreeResponse),
     Index(IndexResponse),
     Logs(LogsResponse),
     Error(ErrorBody),
@@ -102,6 +104,26 @@ pub struct ListRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ListResponse {
     pub items: Vec<ListItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeRequest {
+    pub path: Option<String>,
+    pub depth: Option<u32>,
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeResponse {
+    pub root: TreeNode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeNode {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub children: Vec<TreeNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,7 +225,7 @@ pub struct ListItem {
     pub location: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexMode {
     Full,

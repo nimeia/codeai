@@ -73,14 +73,30 @@
 - 行为：语义匹配符号，返回唯一位置及上下文，可触发编辑器打开。
 
 ## 7. 结构化列表
-- API：`/list/classes`、`/list/methods`、`/list/files`。
-- CLI：`code-nav list classes --project <path> --filter Controller` / `list methods --project <path> --limit 50` / `list files --project <path> --lang ts`。
-- 行为：基于 SQLite metadata 进行结构化查询，支持过滤、排序、分页。
+- **协议**：统一通过 `Request::List(ListRequest { kind, filter, limit })` 下发；`kind` 包含 `Classes|Methods|Files|Tree` 四类，便于复用一条
+  路由；`filter/limit` 预留字段后续支持分页与条件筛选。
+- **CLI**：`code-nav list <classes|methods|files|tree> [--json]`。当前默认输出表格，`--json` 直接透传 `ListResponse` 方便脚本。
+- **格式化**：
+  - `classes/methods/files` 以表格展示基础字段（名称、路径、语言等），缺省情况下以人类可读文本输出。
+  - 当 `kind=Tree` 时复用 list 路由返回 `TreeResponse`，CLI 根据 `--json` 决定输出 JSON 或 ASCII 树。
+- **服务端路由**：master 接收到 list 请求后按 `project` 将请求转发到 worker；worker 基于 metadata 查询结果后直接返回 `ListResponse`
+  或 `TreeResponse`。未索引/项目不存在等错误使用 `Response::Error` 统一返回。
+- **扩展计划**：
+  - `filter` 支持按 `lang/dir/prefix` 等条件筛选。
+  - `limit/offset` 支持分页；表格输出保持对齐，JSON 与协议结构一致。
+  - 表格输出支持 `--format table|json` 扩展，兼容现有 `--json` 语义。
 
 ## 8. 目录树
-- API：`/tree`。
-- CLI：`code-nav tree --project <path> [path] --depth 3 --include-hidden`。
-- 行为：返回目录树与文件类型信息，供 CLI 渲染。
+- **协议**：`Request::Tree(TreeRequest { path: Option<String>, depth: Option<u32>, include_hidden: bool })`；
+  `depth=None` 表示不限制深度，`depth=0` 仅返回根节点，`include_hidden` 控制是否遍历点开头文件夹。
+- **CLI**：`code-nav tree [<path>] [--depth <n>] [--include-hidden] [--json]`，其中 `<path>` 默认为项目根。CLI 将参数封装为
+  `TreeRequest`，通过统一的 RPC 客户端发送，接受 `TreeResponse` 后按模式渲染。
+- **格式化**：
+  - 文本模式使用 ASCII 分支符号（`├──/└──/│`）展示层级，节点包含 `name + (dir/file)` 标签。
+  - `--json` 直接输出结构化 `TreeResponse`，便于其他工具消费。
+- **深度处理**：服务端应在构造响应时递归裁剪子节点以满足 `depth` 限制，`depth=0` 时仅包含根节点，避免多余 IO。
+- **隐藏项处理**：当 `include_hidden=false` 时忽略以 `.` 开头的文件/目录；CLI 无需额外逻辑，由服务端统一控制。
+- **错误处理**：路径不存在、权限不足等情况返回 `Response::Error { code, message }`；CLI 以人类可读格式提示并维持非零退出码。
 
 ## 9. 运行状态与信息 (Runtime Status and Information)
 
