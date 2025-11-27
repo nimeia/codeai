@@ -669,28 +669,16 @@ impl MasterState {
             .map_err(|_| anyhow!("failed to acquire registry lock"))?;
 
         if let Some(existing) = registry.contains_root_mut(&canonical) {
-            let mut updated = false;
-            if existing.autostart != req.autostart {
-                existing.autostart = req.autostart;
-                updated = true;
-            }
-            if existing.watch != req.watch {
-                existing.watch = req.watch;
-                updated = true;
-            }
-            if existing.index_mode != req.index_mode {
-                existing.index_mode = req.index_mode.clone();
-                updated = true;
-            }
-            if existing.model != req.model {
-                existing.model = req.model.clone();
-                updated = true;
-            }
-
+            let updated_existing = Self::update_registry_entry(
+                existing,
+                req.autostart,
+                req.watch,
+                &req.index_mode,
+                &req.model,
+            );
             let project_root_display = canonical.display().to_string();
             let project_id = existing.project_id.clone();
             let existing_clone = existing.clone();
-            let updated_existing = updated;
 
             if updated_existing {
                 registry.persist()?;
@@ -750,6 +738,34 @@ impl MasterState {
         );
 
         Ok((entry, false))
+    }
+
+    fn update_registry_entry(
+        entry: &mut RegistryEntry,
+        autostart: bool,
+        watch: bool,
+        index_mode: &IndexMode,
+        model: &Option<String>,
+    ) -> bool {
+        let mut updated = false;
+        if entry.autostart != autostart {
+            entry.autostart = autostart;
+            updated = true;
+        }
+        if entry.watch != watch {
+            entry.watch = watch;
+            updated = true;
+        }
+        if entry.index_mode != *index_mode {
+            entry.index_mode = index_mode.clone();
+            updated = true;
+        }
+        if entry.model != *model {
+            entry.model = model.clone();
+            updated = true;
+        }
+
+        updated
     }
 
     fn ensure_runtime_entry(
