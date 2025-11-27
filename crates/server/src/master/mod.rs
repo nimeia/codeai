@@ -687,6 +687,7 @@ impl MasterState {
             }
 
             return Ok((existing.clone(), true));
+        }
         if let Some(entry) = registry.contains_root(&canonical) {
             info!(
                 project_root = %canonical.display(),
@@ -1798,7 +1799,7 @@ impl RawConfig {
         let foreground = self.foreground.unwrap_or(false);
         let grace_secs = self.grace_period_secs.unwrap_or(15).clamp(1, 300);
         let log_cfg = self.log.unwrap_or_default();
-        let log_level = log_cfg.level.map(Level::from).unwrap_or(Level::INFO);
+        let log_level = log_cfg.level.map(LogLevel::to_level).unwrap_or(Level::INFO);
         let log_dir = log_cfg.dir.unwrap_or_else(|| runtime_dir.join("logs"));
         let log_dir = if log_dir.is_relative() {
             runtime_dir.join(log_dir)
@@ -2234,9 +2235,9 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-impl From<LogLevel> for Level {
-    fn from(level: LogLevel) -> Self {
-        match level {
+impl LogLevel {
+    fn to_level(self) -> Level {
+        match self {
             LogLevel::Trace => Level::TRACE,
             LogLevel::Debug => Level::DEBUG,
             LogLevel::Info => Level::INFO,
