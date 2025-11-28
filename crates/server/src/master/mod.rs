@@ -1,7 +1,7 @@
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap},
     ffi::OsStr,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{self, Write},
     net::{SocketAddr, ToSocketAddrs},
@@ -25,12 +25,12 @@ use code_nav_core::{
 use code_nav_protocol::{
     ErrorBody, ErrorCode, GotoRequest, GotoResponse, IndexMode, IndexRequest, IndexResponse,
     IndexerState, InfoRequest, InfoResponse, ListItem, ListKind, ListRequest, ListResponse,
-    LogsRequest, MasterInfo, MasterStatus, ProjectAddRequest, ProjectAddResponse, ProjectInfo,
-    ProjectListRequest, ProjectListResponse, ProjectRef, ProjectRemoveRequest,
-    ProjectRemoveResponse, ProjectRestartRequest, ProjectRestartResponse, ProjectStatusRequest,
-    ProjectStatusResponse, Request, Response, SearchRequest, SearchResponse, StatusRequest,
-    StatusResponse, TreeNode, TreeRequest, TreeResponse, WorkerInfo, WorkerState, WorkerStatus,
-    WorkerSummary,
+    LogEvent, LogLevel, LogsRequest, MasterInfo, MasterStatus, ProjectAddRequest,
+    ProjectAddResponse, ProjectInfo, ProjectListRequest, ProjectListResponse, ProjectRef,
+    ProjectRemoveRequest, ProjectRemoveResponse, ProjectRestartRequest, ProjectRestartResponse,
+    ProjectStatusRequest, ProjectStatusResponse, Request, Response, SearchRequest, SearchResponse,
+    StatusRequest, StatusResponse, TreeNode, TreeRequest, TreeResponse, WorkerInfo, WorkerState,
+    WorkerStatus, WorkerSummary,
 };
 use fslock::LockFile;
 use is_terminal::IsTerminal;
@@ -587,13 +587,7 @@ fn handle_rpc_request(state: &MasterState, request: Request) -> Response {
                 }),
             },
         },
-        Request::Logs(req) => match logs::global() {
-            Some(service) => service.handle_request(req),
-            None => Response::Error(ErrorBody {
-                code: ErrorCode::InternalError,
-                message: "日志服务尚未初始化".to_string(),
-            }),
-        },
+        Request::Logs(req) => state.handle_logs(req),
         Request::ProjectAdd(req) => match state.register_project(req) {
             Ok(response) => Response::ProjectAdd(response),
             Err(err) => Response::Error(ErrorBody {
@@ -932,6 +926,14 @@ impl MasterState {
             "starting worker"
         );
 
+        self.log_worker_event(
+            &entry.project_id,
+            LogLevel::Info,
+            "worker bootstrap starting",
+            Some("worker::bootstrap"),
+            [("project_root", entry.project_root.display().to_string())],
+        );
+
         if let Err(err) = self.prepare_worker_runtime(&entry) {
             warn!(
                 project_id = %entry.project_id,
@@ -946,6 +948,14 @@ impl MasterState {
             return;
         }
 
+        self.log_worker_event(
+            &entry.project_id,
+            LogLevel::Info,
+            "worker runtime prepared",
+            Some("worker::bootstrap"),
+            [],
+        );
+
         if let Err(err) = self.set_worker_state(&entry.project_id, WorkerState::Indexing, None) {
             warn!(
                 project_id = %entry.project_id,
@@ -954,6 +964,14 @@ impl MasterState {
             );
             return;
         }
+
+        self.log_worker_event(
+            &entry.project_id,
+            LogLevel::Info,
+            "starting full index",
+            Some("worker::index"),
+            [("mode", "full")],
+        );
 
         let index_result = self
             .run_index_job_async(entry.clone(), IndexRunMode::Full)
@@ -978,6 +996,18 @@ impl MasterState {
                     );
                     return;
                 }
+
+                self.log_worker_event(
+                    &entry.project_id,
+                    LogLevel::Info,
+                    "full index completed",
+                    Some("worker::index"),
+                    [
+                        ("files_total", report.files_total.to_string()),
+                        ("files_indexed", report.files_indexed.to_string()),
+                        ("symbols", report.symbols_indexed.to_string()),
+                    ],
+                );
                 if let Ok(mut registry) = self.registry.lock() {
                     if let Err(err) = registry.mark_running(&entry.project_id, true) {
                         warn!(
@@ -1023,6 +1053,14 @@ impl MasterState {
                     &entry.project_id,
                     WorkerState::Failed,
                     Some(err.to_string()),
+                );
+
+                self.log_worker_event(
+                    &entry.project_id,
+                    LogLevel::Error,
+                    "full index failed",
+                    Some("worker::index"),
+                    [("error", err.to_string())],
                 );
             }
         }
@@ -1081,6 +1119,14 @@ impl MasterState {
                     return;
                 }
 
+                state.log_worker_event(
+                    &project_id,
+                    LogLevel::Info,
+                    "watch-triggered index start",
+                    Some("worker::index"),
+                    [("mode", "incremental")],
+                );
+
                 let result = state.run_index_job_blocking(
                     &project_id,
                     &project_root,
@@ -1105,6 +1151,18 @@ impl MasterState {
                                 "failed to mark worker as running",
                             );
                         }
+
+                        state.log_worker_event(
+                            &project_id,
+                            LogLevel::Info,
+                            "watch-triggered index completed",
+                            Some("worker::index"),
+                            [
+                                ("files_total", report.files_total.to_string()),
+                                ("files_indexed", report.files_indexed.to_string()),
+                                ("symbols", report.symbols_indexed.to_string()),
+                            ],
+                        );
                     }
                     Err(err) => {
                         warn!(
@@ -1116,6 +1174,14 @@ impl MasterState {
                             &project_id,
                             WorkerState::Failed,
                             Some(err.to_string()),
+                        );
+
+                        state.log_worker_event(
+                            &project_id,
+                            LogLevel::Error,
+                            "watch-triggered index failed",
+                            Some("worker::index"),
+                            [("error", err.to_string())],
                         );
                     }
                 }
@@ -1230,6 +1296,7 @@ impl MasterState {
         let runtime = workers
             .get_mut(project_id)
             .ok_or_else(|| anyhow!("worker {project_id} not found"))?;
+        let previous_state = runtime.summary.status.clone();
         runtime.summary.status = state.clone();
         runtime.last_error = last_error.clone();
         runtime.indexer_state.state = state.clone();
@@ -1239,6 +1306,23 @@ impl MasterState {
         }
         let snapshot = runtime.snapshot();
         drop(workers);
+
+        if previous_state != state {
+            let mut fields = vec![
+                ("previous", format!("{:?}", previous_state)),
+                ("next", format!("{:?}", state)),
+            ];
+            if let Some(err) = last_error.as_ref() {
+                fields.push(("error", err.clone()));
+            }
+            self.log_worker_event(
+                project_id,
+                LogLevel::Info,
+                "worker state updated",
+                None,
+                fields,
+            );
+        }
 
         self.update_project_state(project_id, worker_state_label(&state), last_error)?;
         self.persist_worker_state(project_id)?;
@@ -1349,6 +1433,167 @@ impl MasterState {
             uptime_secs: 0,
             workers,
         })
+    }
+
+    fn handle_logs(&self, req: LogsRequest) -> Response {
+        let Some(service) = logs::global() else {
+            return Response::Error(ErrorBody {
+                code: ErrorCode::InternalError,
+                message: "日志服务尚未初始化".to_string(),
+            });
+        };
+
+        match req.target.clone() {
+            LogTarget::Master => service.handle_master_request(req),
+            LogTarget::Worker(project) => {
+                let Some(entry) = self.resolve_project(&project) else {
+                    return Response::Error(ErrorBody {
+                        code: ErrorCode::InvalidRequest,
+                        message: "project not found".to_string(),
+                    });
+                };
+
+                match self.read_worker_logs(
+                    &entry.project_id,
+                    req.since,
+                    req.limit,
+                    req.level,
+                    req.follow,
+                    req.follow_interval_ms,
+                ) {
+                    Ok(events) => Response::Logs(LogsResponse { events }),
+                    Err(err) => Response::Error(ErrorBody {
+                        code: ErrorCode::InternalError,
+                        message: err.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn read_worker_logs(
+        &self,
+        project_id: &str,
+        since: Option<i64>,
+        limit: Option<u32>,
+        level: Option<LogLevel>,
+        follow: bool,
+        follow_interval_ms: Option<u64>,
+    ) -> Result<Vec<LogEvent>> {
+        let path = self.worker_log_spool.join(format!("{}.log", project_id));
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let interval_ms = follow_interval_ms.unwrap_or(250);
+        let deadline = if follow {
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(interval_ms))
+        } else {
+            None
+        };
+
+        loop {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read worker log spool {}", path.display()))?;
+            let mut events = Vec::new();
+            for (idx, line) in content.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<LogEvent>(line) {
+                    Ok(event) => events.push(event),
+                    Err(err) => warn!(
+                        project_id = %project_id,
+                        line = idx,
+                        error = %err,
+                        "skip malformed worker log line"
+                    ),
+                }
+            }
+
+            let mut filtered: Vec<LogEvent> = events
+                .into_iter()
+                .filter(|ev| match (since, level.as_ref()) {
+                    (Some(since_ts), _) if ev.ts < since_ts => false,
+                    (_, Some(level_filter))
+                        if logs::level_rank(&ev.level) < logs::level_rank(level_filter) =>
+                    {
+                        false
+                    }
+                    _ => true,
+                })
+                .collect();
+
+            if let Some(max) = limit {
+                let max = max as usize;
+                if filtered.len() > max {
+                    filtered.drain(0..filtered.len() - max);
+                }
+            }
+
+            if !follow {
+                return Ok(filtered);
+            }
+
+            if !filtered.is_empty() {
+                return Ok(filtered);
+            }
+
+            if deadline
+                .as_ref()
+                .is_some_and(|deadline| std::time::Instant::now() >= *deadline)
+            {
+                return Ok(filtered);
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn append_worker_log(&self, project_id: &str, event: &LogEvent) -> Result<()> {
+        fs::create_dir_all(&self.worker_log_spool)?;
+        let path = self.worker_log_spool.join(format!("{}.log", project_id));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open worker log spool {}", path.display()))?;
+        serde_json::to_writer(&mut file, event)?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn log_worker_event(
+        &self,
+        project_id: &str,
+        level: LogLevel,
+        message: impl Into<String>,
+        target: Option<&str>,
+        fields: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) {
+        let event = LogEvent {
+            ts: Utc::now().timestamp(),
+            level: level.clone(),
+            source: format!("worker:{}", project_id),
+            target: target.map(|value| value.to_string()),
+            message: message.into(),
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        };
+
+        if let Err(err) = self.append_worker_log(project_id, &event) {
+            warn!(
+                project_id = %project_id,
+                error = %err,
+                "failed to append worker log to spool"
+            );
+        }
+
+        if let Some(service) = logs::global() {
+            service.record(event);
+        }
     }
 
     fn resolve_project(&self, project: &ProjectRef) -> Option<RegistryEntry> {

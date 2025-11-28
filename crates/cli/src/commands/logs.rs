@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, thread, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -94,40 +94,58 @@ pub fn run(ctx: &CliContext, args: LogsArgs) -> Result<()> {
     }
     let limit = args.limit.min(10_000);
     let target = build_target(&args)?;
-    let since = match args.since.as_deref() {
+    let mut since = match args.since.as_deref() {
         Some(value) => Some(parse_since(value)?),
         None => None,
     };
-    let request_payload = LogsRequest {
-        target,
-        since,
-        limit: Some(limit),
-        follow: args.follow,
-        follow_interval_ms: Some(args.follow_interval_ms),
-        level: args.level.map(Into::into),
-        format: if args.json {
-            LogOutputFormat::Json
-        } else {
-            LogOutputFormat::Text
-        },
-    };
+    let mut last_seen = since;
 
-    let response = ctx.client.send(&Request::Logs(request_payload))?;
+    loop {
+        let request_payload = LogsRequest {
+            target: target.clone(),
+            since,
+            limit: Some(limit),
+            follow: args.follow,
+            follow_interval_ms: Some(args.follow_interval_ms),
+            level: args.level.map(Into::into),
+            format: if args.json {
+                LogOutputFormat::Json
+            } else {
+                LogOutputFormat::Text
+            },
+        };
 
-    if let code_nav_protocol::Response::Logs(logs_response) = response {
+        let response = ctx.client.send(&Request::Logs(request_payload))?;
+
+        let logs_response = match response {
+            code_nav_protocol::Response::Logs(resp) => resp,
+            other => bail!(
+                "Error: received unexpected response type from server: {:?}",
+                other
+            ),
+        };
+
         if args.json {
             formatter::print_line(&serde_json::to_string_pretty(&logs_response)?);
         } else {
-            // Placeholder: just print messages for now.
-            for event in logs_response.events {
+            for event in &logs_response.events {
                 formatter::print_line(&format!(
                     "[{:?}] {}: {}",
                     event.level, event.source, event.message
                 ));
             }
         }
-    } else {
-        bail!("Error: received unexpected response type from server");
+
+        if let Some(max_ts) = logs_response.events.iter().map(|ev| ev.ts).max() {
+            last_seen = Some(last_seen.map_or(max_ts, |prev| prev.max(max_ts)));
+        }
+
+        if !args.follow {
+            break;
+        }
+
+        since = Some(last_seen.unwrap_or_else(|| Utc::now().timestamp()) + 1);
+        thread::sleep(Duration::from_millis(args.follow_interval_ms));
     }
 
     Ok(())
