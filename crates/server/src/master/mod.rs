@@ -2350,7 +2350,7 @@ impl RawConfig {
         let foreground = self.foreground.unwrap_or(false);
         let grace_secs = self.grace_period_secs.unwrap_or(15).clamp(1, 300);
         let log_cfg = self.log.unwrap_or_default();
-        let log_level = log_cfg.level.map(LogLevel::to_level).unwrap_or(Level::INFO);
+        let log_level = log_cfg.level.map(log_level_to_tracing_level).unwrap_or(Level::INFO);
         let log_dir = log_cfg.dir.unwrap_or_else(|| runtime_dir.join("logs"));
         let log_dir = if log_dir.is_relative() {
             runtime_dir.join(log_dir)
@@ -2760,19 +2760,6 @@ pub enum LogLevel {
     Error,
 }
 
-impl LogLevel {
-    fn from_str_case_insensitive(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "trace" => Ok(Self::Trace),
-            "debug" => Ok(Self::Debug),
-            "info" => Ok(Self::Info),
-            "warn" | "warning" => Ok(Self::Warn),
-            "error" => Ok(Self::Error),
-            other => Err(anyhow!("unknown log level {other}")),
-        }
-    }
-}
-
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
@@ -2786,14 +2773,12 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-impl LogLevel {
-    fn to_level(self) -> Level {
-        match self {
-            LogLevel::Trace => Level::TRACE,
-            LogLevel::Debug => Level::DEBUG,
-            LogLevel::Info => Level::INFO,
-            LogLevel::Warn => Level::WARN,
-            LogLevel::Error => Level::ERROR,
-        }
+fn log_level_to_tracing_level(level: LogLevel) -> Level {
+    match level {
+        LogLevel::Trace => Level::TRACE,
+        LogLevel::Debug => Level::DEBUG,
+        LogLevel::Info => Level::INFO,
+        LogLevel::Warn => Level::WARN,
+        LogLevel::Error => Level::ERROR,
     }
 }
