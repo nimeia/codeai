@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use code_nav_protocol::{LogEvent, LogLevel, LogTarget, LogsRequest, LogsResponse, Response};
@@ -37,20 +38,30 @@ impl LogsService {
 
     pub fn handle_request(&self, request: LogsRequest) -> Response {
         match request.target {
-            LogTarget::Master => {
-                if request.follow {
-                    return Response::Error(code_nav_protocol::ErrorBody {
-                        code: code_nav_protocol::ErrorCode::Unsupported,
-                        message: "follow 模式暂未实现".to_string(),
-                    });
-                }
-                let events = self.collect(request.since, request.limit, request.level);
-                Response::Logs(LogsResponse { events })
-            }
+            LogTarget::Master => self.handle_master_request(request),
             LogTarget::Worker(_) => Response::Error(code_nav_protocol::ErrorBody {
                 code: code_nav_protocol::ErrorCode::Unsupported,
                 message: "worker 日志暂未实现".to_string(),
             }),
+        }
+    }
+
+    pub fn handle_master_request(&self, request: LogsRequest) -> Response {
+        let interval_ms = request.follow_interval_ms.unwrap_or(250);
+
+        if !request.follow {
+            let events = self.collect(request.since, request.limit, request.level);
+            return Response::Logs(LogsResponse { events });
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(interval_ms);
+        loop {
+            let events = self.collect(request.since, request.limit, request.level.clone());
+            if !events.is_empty() || Instant::now() >= deadline {
+                return Response::Logs(LogsResponse { events });
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -64,7 +75,9 @@ impl LogsService {
             guard.pop_front();
         }
 
-        event.ts = Utc::now().timestamp();
+        if event.ts == 0 {
+            event.ts = Utc::now().timestamp();
+        }
         guard.push_back(event);
     }
 
@@ -185,7 +198,7 @@ pub fn history_capacity_or_default(value: Option<usize>) -> usize {
     value.unwrap_or(DEFAULT_HISTORY_CAP)
 }
 
-fn level_rank(level: &LogLevel) -> u8 {
+pub fn level_rank(level: &LogLevel) -> u8 {
     match level {
         LogLevel::Trace => 0,
         LogLevel::Debug => 1,
